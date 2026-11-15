@@ -1,0 +1,162 @@
+package main
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+// benchStudents 合成 2112 条名单（规模与真实数据一致；真实姓名不入库，符合隐私红线）。
+func benchStudents() []Student {
+	surnames := []string{"张", "王", "李", "赵", "陈", "刘", "杨", "黄", "周", "吴"}
+	given := []string{"伟", "芳", "娜", "敏", "静", "强", "磊", "洋", "艳", "勇", "军", "杰", "娟", "涛", "明", "超"}
+	grades := []Grade{GradeOne, GradeTwo, GradeThree}
+	students := make([]Student, 0, 2112)
+	for gi, grade := range grades {
+		for class := 1; class <= 22; class++ {
+			for k := 0; k < 32; k++ {
+				name := surnames[(gi*7+class+k)%len(surnames)] +
+					given[(gi*13+class*3+k*5)%len(given)] +
+					given[(gi*3+class*7+k*11)%len(given)]
+				students = append(students, newStudent(name, grade, fmt.Sprintf("%d班", class), parseClassName(fmt.Sprintf("%d班", class))))
+			}
+		}
+	}
+	return students
+}
+
+func BenchmarkSearchByName(b *testing.B) {
+	students := benchStudents()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = Search(students, "张伟", 10, 0)
+	}
+}
+
+func BenchmarkSearchByGrade(b *testing.B) {
+	students := benchStudents()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = Search(students, "高一", 10, 0)
+	}
+}
+
+func BenchmarkSearchCombined(b *testing.B) {
+	students := benchStudents()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = Search(students, "高二, 张, 3班", 10, 0)
+	}
+}
+
+func BenchmarkStoreView(b *testing.B) {
+	dir := b.TempDir()
+	_ = os.WriteFile(filepath.Join(dir, "高一.json"),
+		[]byte(`{"区县":"福清市","学校":[{"校名":"福清一中","年级":[{"年级名":"高一","班级":[{"班名":"1班","学生":[{"姓名":"张三"}]}]}]}]}`), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, "高二.json"),
+		[]byte(`{"区县":"福清市","学校":[{"校名":"福清二中","年级":[{"年级名":"高二","班级":[{"班名":"2班","学生":[{"姓名":"李四"}]}]}]}]}`), 0o644)
+	store, err := newStudentStore(dir, time.Now)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := store.view(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// TestSearchAllocsBudget 分配次数硬预算：与机器速度无关的确定性回归防线。
+// 耗时随负载抖动，分配次数不会——一旦优化退化（例如排序重新引入正则），此测试立即失败。
+//
+// 样本集须覆盖解析分支的取值域，而不只是「典型查询」：修复前三条样本全部走
+// ASCII 数字班级，汉字数字路径（chineseNumberToInt 的 []rune 分配）与降级路径
+// （classCondition 判定无法解析/溢出后按姓名处理）一次都没进入预算，
+// 落在那两条路径上的分配退化不会翻红。实测（2026-09-30 探针）：
+// 「3班」7、「十二班」9、「一一班」6、「99999999999999999999班」10。
+//
+// 诚实边界：预算是上限而非实测值，下表的 budget 一律是上限，t.Logf 打印实测值。
+//
+// **竞态插桩下本测试必须跳过**：CI 跑的是 `go test -race`，而 -race 会给每条
+// 路径插入额外的分配。实测（2026-10-01 在 CI 上取对拍数据，同一 commit、
+// 同一 ubuntu runner，唯一变量是 -race 开关）：
+//
+//	不带 race：6 / 7 / 8 / 9 / 6 / 10 / 6   全部通过
+//	带   race：7 / 8 / 12 / 11 / …          「组合查询」正好触顶 12、
+//	                                      「汉字数字班级」越过预算 10
+//
+// 本表的预算是按**不带 race** 的实测值收紧的，因此带 race 跑必然偏红。
+// 那种红测的是竞态检测器的插桩开销，不是被测代码的分配退化——把它当成
+// 分配退化去「修」，会为了迁就测量工具而改动零分配热路径。
+// 判据用构建标记而非运行时探测：`-race` 不暴露运行时标志，
+// 而 BuildID 后缀（go1.26.1 vs go1.26.1-race）在 CI 与本机均稳定可用。
+// 代价是本机 `CGO_ENABLED=0` 跑不了 -race，故该路径只由 CI 覆盖。
+func TestSearchAllocsBudget(t *testing.T) {
+	if isRaceEnabled {
+		t.Skip("竞态插桩会抬高每条路径的分配数，本预算按无插桩的实测值设定；见上方说明")
+	}
+	students := benchStudents()
+	tests := []struct {
+		name   string
+		query  string
+		budget float64
+	}{
+		{"单姓名查询", "张", 12},
+		{"整年段查询", "高一", 12},
+		{"组合查询", "高二, 张, 3班", 12},
+		// 汉字数字班级：走 chineseNumberToInt，与 ASCII 数字分支是不同的实现。
+		// 预算按实测值 9 收紧（原三条一律 12 是因为它们从未覆盖这条路径）：
+		// 变异实验确认把该路径的 []rune 换成多一次字符串构造后分配由 9 涨到 12，
+		// 即预算 12 时余量为 0、几乎不承重；收到 10 才有 1 次余量可察觉退化。
+		{"汉字数字班级", "十二班", 10},
+		// 降级路径：班级不可解析、整个 token 按姓名处理。修复前无预算覆盖，
+		// 而降级被错误实现改回「静默丢弃 token」时分配反而下降、预算全绿——
+		// 预算对这类行为退化是失明的，它只锁「不分配过多」。
+		{"班级降级为姓名", "一一班", 8},
+		{"班级溢出降级", "99999999999999999999班", 12},
+		// 年段+班级连写：走 splitGradeClass 最长前缀切分，组合查询那条走不到。
+		{"年级班级连写", "高二3班", 8},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			allocs := testing.AllocsPerRun(100, func() { _ = Search(students, tt.query, 10, 0) })
+			if allocs > tt.budget {
+				t.Fatalf("分配次数退化：实测 %.1f，预算 %.0f", allocs, tt.budget)
+			}
+			t.Logf("%s 分配次数 %.1f（预算 %.0f）", tt.name, allocs, tt.budget)
+		})
+	}
+}
+
+// TestStoreViewAllocsBudget 视图路径分配预算：view 在探测节流命中时应零分配。
+func TestStoreViewAllocsBudget(t *testing.T) {
+	dir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(dir, "高一.json"),
+		[]byte(`{"区县":"福清市","学校":[{"校名":"福清一中","年级":[{"年级名":"高一","班级":[{"班名":"1班","学生":[{"姓名":"张三"}]}]}]}]}`), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, "高二.json"),
+		[]byte(`{"区县":"福清市","学校":[{"校名":"福清二中","年级":[{"年级名":"高二","班级":[{"班名":"2班","学生":[{"姓名":"李四"}]}]}]}]}`), 0o644)
+	store, err := newStudentStore(dir, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 预热：首次 view 触发探测与加载，不计入预算
+	if _, err := store.view(); err != nil {
+		t.Fatal(err)
+	}
+	allocs := testing.AllocsPerRun(100, func() {
+		if _, err := store.view(); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if allocs > 4 {
+		t.Fatalf("视图路径分配次数退化：实测 %.1f，预算 4", allocs)
+	}
+	t.Logf("视图路径分配次数 %.1f（预算 4）", allocs)
+}

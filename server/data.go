@@ -1,0 +1,410 @@
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+type sourceStudent struct {
+	Name string `json:"姓名"`
+}
+
+// 新格式（build_hierarchy_json.py 输出的无账密 roster）：
+//   { "区县": "...", "学校": [{ "校名": "...", "年级": [{ "年级名": "...",
+//     "班级": [{ "班名": "...", "学生": [{ "姓名": "..." }] }] }] }] }
+type sourceClass struct {
+	Name     string           `json:"班名"`
+	Students []sourceStudent `json:"学生"`
+}
+
+type sourceGrade struct {
+	Name    string        `json:"年级名"`
+	Classes []sourceClass `json:"班级"`
+}
+
+type sourceSchool struct {
+	Name   string         `json:"校名"`
+	Grades []sourceGrade  `json:"年级"`
+}
+
+type sourceDocument struct {
+	District string         `json:"区县"`
+	Schools  []sourceSchool `json:"学校"`
+}
+
+type fileStamp struct {
+	size    int64
+	modTime time.Time
+}
+
+// probeInterval 文件指纹探测节流窗口。
+// 热重载的真实场景是管理员手工替换名单文件，1 秒延迟无感；
+// 收益是消除每请求 3 次 os.Stat 的系统调用开销。
+const probeInterval = time.Second
+
+// reloadCooldown 重载失败后的冷却窗口：失败指纹未变时不再重复读盘与解析。
+// 运维更新名单采用"临时文件→原子替换"，1 秒探测节流与 2 秒失败冷却是同一条时间线上的两个窗口。
+const reloadCooldown = 2 * time.Second
+
+type studentStore struct {
+	dir                string
+	mu                 sync.RWMutex
+	reloadMu           sync.Mutex
+	items              []Student
+	stamps             map[string]fileStamp
+	lastProbe          atomic.Int64         // 上次文件指纹探测的 Unix 毫秒（节流基准）
+	lastFailAt         atomic.Int64         // 上次重载失败的 Unix 毫秒（与 lastProbe 共用同一时钟）
+	lastFailStamps     map[string]fileStamp // 失败时的文件指纹：文件未变则冷却，变化则立即重试
+	lastFailStampKnown bool                 // 失败是否发生在指纹采集阶段（dataStamps 失败时为 false）：
+	// 显式区分"失败且指纹未知"与"失败且指纹已知"，避免 lastFailStamps 为 nil
+	// 同时表示"目录缺失"与"空指纹"两种情形导致冷却判定失效。
+	lastFailErr error            // 上次失败的原始错误：冷却期对外保留根因，不退化为无信息量的哨兵
+	now         func() time.Time // 构造注入的时钟，供测试确定性推进探测与冷却
+}
+
+func loadStudents(dir string) ([]Student, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("读取数据目录失败: %w", err)
+	}
+	// 文件名排序保证加载顺序确定：学校展示序与同分排序都以首次出现序为准。
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if !isRosterFile(entry.Name()) {
+			continue
+		}
+		names = append(names, entry.Name())
+	}
+	sort.Strings(names)
+	if len(names) == 0 {
+		return nil, errNoRoster()
+	}
+
+	students := make([]Student, 0)
+	seen := make(map[string]struct{})
+	schoolOrder := make(map[string]int)
+	nextSchool := 0
+	for _, name := range names {
+		payload, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			return nil, fmt.Errorf("读取 %s 失败: %w", name, err)
+		}
+		payload = bytes.TrimPrefix(payload, []byte{0xEF, 0xBB, 0xBF})
+		var document sourceDocument
+		if err := json.Unmarshal(payload, &document); err != nil {
+			return nil, fmt.Errorf("解析 %s 失败: %w", name, err)
+		}
+		if len(document.Schools) == 0 {
+			return nil, fmt.Errorf("%s 缺少学校数据（不是 roster 格式）", name)
+		}
+		for _, school := range document.Schools {
+			schoolName := strings.TrimSpace(school.Name)
+			if schoolName == "" {
+				return nil, fmt.Errorf("%s 存在缺少校名的学校记录", name)
+			}
+			if _, duplicated := schoolOrder[schoolName]; duplicated {
+				return nil, fmt.Errorf("校名重复: %s（%s）", schoolName, name)
+			}
+			schoolIdx := nextSchool
+			schoolOrder[schoolName] = schoolIdx
+			nextSchool++
+			for _, grade := range school.Grades {
+				gradeName := strings.TrimSpace(grade.Name)
+				if gradeName == "" {
+					return nil, fmt.Errorf("%s / %s 存在缺少年级名的年级记录", name, schoolName)
+				}
+				gradeValue := Grade(gradeName)
+				for _, class := range grade.Classes {
+					className := strings.TrimSpace(class.Name)
+					if className == "" {
+						return nil, fmt.Errorf("%s / %s / %s 存在缺少班名的班级记录", name, schoolName, gradeName)
+					}
+					parsed := parseClassName(className)
+					if !parsed.Valid {
+						return nil, fmt.Errorf("%s / %s / %s 班级格式异常（%s）", name, schoolName, gradeName, className)
+					}
+					for _, item := range class.Students {
+						studentName := item.Name
+						if studentName == "" {
+							return nil, fmt.Errorf("%s / %s / %s 学生记录格式异常", name, schoolName, className)
+						}
+						student := newStudentSchool(schoolName, studentName, gradeValue, className, parsed, schoolIdx)
+						// 去重键含学校：跨校同名同班不再互吞。班号而非班名仍是班级身份。
+						key := schoolName + "\x00" + gradeName + "\x00" + strconv.Itoa(parsed.ClassNo) + "\x00" + student.NameKey
+						if _, exists := seen[key]; exists {
+							continue
+						}
+						seen[key] = struct{}{}
+						students = append(students, student)
+					}
+				}
+			}
+		}
+	}
+	return students, nil
+}
+
+// isRosterFile 判定目录项是否为待加载的 roster 文件：小写 .json 后缀且非隐藏文件。
+// 名单文件的文件名不参与语义（学校身份取自 JSON 内容），此函数只做后缀筛选。
+func isRosterFile(name string) bool {
+	if strings.HasPrefix(name, ".") {
+		return false
+	}
+	return strings.HasSuffix(strings.ToLower(name), ".json")
+}
+
+// newStudentStore 构造并立即完成首次加载（force 路径）。
+// now 由构造函数注入：探测节流与失败冷却共用同一条时间线，
+// 测试通过构造参数推进时间，不从外部改写可写字段。
+func newStudentStore(dir string, now func() time.Time) (*studentStore, error) {
+	store := &studentStore{dir: dir, now: now}
+	if err := store.reload(true); err != nil {
+		return nil, err
+	}
+	return store, nil
+}
+
+// recoveryDue 是自恢复时机的单一判定点：探测节流（1 秒窗口）与失败冷却
+// （2 秒窗口）两条时间轴在此汇合，由调用方传入统一取样的 now。
+// 「同一条时间线」因此从注释承诺变成代码事实——改任一窗口不会绕开另一条轴。
+//
+// probe=true 表示应探测文件指纹（节流窗口已过，或尚无探测基准）。
+// retry=true 表示可重试失败重载（冷却窗口已过，或尚无失败基准）。
+// 失败期间的指纹变化重试由 cooling 单独判定，不在本函数职责内。
+func (s *studentStore) recoveryDue(now time.Time) (probe bool, retry bool) {
+	nowMS := now.UnixMilli()
+	lastProbe := s.lastProbe.Load()
+	probe = lastProbe == 0 || nowMS-lastProbe >= probeInterval.Milliseconds()
+	lastFail := s.lastFailAt.Load()
+	retry = lastFail == 0 || nowMS-lastFail >= reloadCooldown.Milliseconds()
+	return probe, retry
+}
+
+// probeThrottled 判定本次是否应跳过文件指纹探测。
+// 窗口是否已过由 recoveryDue 单点判定；此处只负责并发安全：
+// 用原子 CAS 保证同一窗口内仅一个请求获得探测权，其余被节流。
+func (s *studentStore) probeThrottled() bool {
+	now := s.now()
+	if probe, _ := s.recoveryDue(now); !probe {
+		return true
+	}
+	// 需要探测：CAS 占有本次探测权；若失败说明其他请求刚探测过，按节流处理
+	if s.lastProbe.CompareAndSwap(s.lastProbe.Load(), now.UnixMilli()) {
+		return false
+	}
+	return true
+}
+
+// errDataUnavailable 表示名单当前不可用：启动时数据目录无有效名单，或已观察到的
+// 名单变更在重载时失败。共享哨兵值，避免每次读取为同一原因分配新错误对象。
+var errDataUnavailable = errors.New("数据不可用")
+
+// errNoRoster 构造「数据目录中一个年段文件都没有」的错误。
+// 单一事实源：loadStudents 与 dataStamps 各自独立判定这一事实，此前两处
+// 逐字复制同一句指引。改为从 knownGrades 生成年段清单，使指引不再硬编码
+// 高一/高二/高三三个——扩展年段只需在 knownGrades 追加，运维提示自动跟随，
+// 不会在新增年段后继续提示放一个已不被支持的文件名。
+func errNoRoster() error {
+	return errors.New("数据文件缺失，请将 roster JSON（区县/学校/年级/班级/学生 结构）放入数据目录")
+}
+
+// view 返回当前可用的名单只读视图（零拷贝），数据不可用时返回错误。
+// 可用性判定完全由 reload 承担：探测、串行重载、失败冷却与恢复都在 reload 内闭环，
+// 因此 reload 一旦返回错误，内存中保留的旧快照就不会被当作当前可用数据返回。
+// 并发安全性：reload 整体替换 s.items 切片，从不就地修改底层数组，
+// 因此持有旧切片的读者不受后续重载影响。
+// 调用方必须只读：不得修改返回切片或其元素（需要可写副本时自行拷贝）。
+func (s *studentStore) view() ([]Student, error) {
+	if err := s.reload(false); err != nil {
+		return nil, err
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.items, nil
+}
+
+// Size 返回当前名单的学生数，供启动自举日志使用。
+// 只读计数入口：不暴露切片本身，维持"view() 是唯一数据访问入口"的纪律。
+func (s *studentStore) Size() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.items)
+}
+
+// reload 探测文件指纹并串行重载，是数据可用性的唯一判定点。
+// force 供启动自举使用，绕过探测节流与失败冷却。
+// 探测节流只表示"本窗口已有人探测过"，绝不表示"当前数据健康"：
+// 命中节流时返回 nil 表示"沿用已发布的当前状态"（成功即返回当前快照，失败即返回不可用）。
+// 失败已发布时不参与探测节流：此时节流会让"指纹变化立即重试"失效，
+// 使已修好的名单最长延迟一个节流窗口才恢复，多一次 stat 的代价远低于持续不可用。
+func (s *studentStore) reload(force bool) error {
+	// 探测节流：force（启动自举）与超过窗口的请求才真正探测文件指纹
+	if !force && s.lastFailAt.Load() == 0 && s.probeThrottled() {
+		return nil
+	}
+	stamps, err := dataStamps(s.dir)
+	if err != nil {
+		s.recordFailure(nil, err)
+		return err
+	}
+	s.mu.RLock()
+	unchanged := !force && sameStamps(s.stamps, stamps)
+	s.mu.RUnlock()
+	if unchanged {
+		return nil
+	}
+
+	// 互斥重载：确保高并发下同一时刻仅有一个协程执行磁盘读取与反序列化，防御惊群
+	s.reloadMu.Lock()
+	defer s.reloadMu.Unlock()
+
+	// 双重检查：排队获得重载锁的协程在此检测前一个协程是否已经完成重载
+	s.mu.RLock()
+	unchanged = !force && sameStamps(s.stamps, stamps)
+	s.mu.RUnlock()
+	if unchanged {
+		return nil
+	}
+
+	// 失败冷却：数据损坏期间每次请求都重试解析坏文件会放大 IO 与日志。
+	// 仅当文件指纹与失败时相同（坏文件未变）才冷却；文件被修复（指纹变化）则立即重试。
+	// 冷却期返回原始失败原因而非裸哨兵，使调用方能区分解析失败、标题不一致、
+	// 班级格式异常等具体成因。注意成因的**日志**出口不在调用方：api.go 的
+	// searchHandler 丢弃 view 的错误、只写 {"error":"data_unavailable"}，
+	// 带成因的日志由 recordFailure 单点打出（可能由健康探针触发而非 search）。
+	// 此处保证的是错误值本身携带成因，wire 上仍只有错误码。
+	if s.cooling(stamps) {
+		return s.coolingError()
+	}
+	items, err := loadStudents(s.dir)
+	if err != nil {
+		s.recordFailure(stamps, err)
+		return err
+	}
+	s.mu.Lock()
+	s.items = items
+	s.stamps = stamps
+	s.lastFailStamps = nil
+	s.lastFailStampKnown = false
+	s.lastFailErr = nil
+	s.lastFailAt.Store(0)
+	s.mu.Unlock()
+	if !force {
+		logInfof("data reloaded: %d students", len(items))
+	}
+	return nil
+}
+
+// cooling 判定当前是否处于失败冷却窗口：距上次失败不足 reloadCooldown，
+// 且失败指纹未变（文件被修复则立即重试）。
+// 指纹采集阶段失败（lastFailStampKnown 为 false）时没有可比对的指纹，
+// 按"未变化"处理：仅由冷却窗口约束重试频率。修复前 lastFailStamps 为 nil 时
+// sameStamps(nil, stamps) 恒为 false，冷却判定永不成立，与注释承诺相反。
+func (s *studentStore) cooling(stamps map[string]fileStamp) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.lastFailStampKnown && !sameStamps(s.lastFailStamps, stamps) {
+		return false
+	}
+	_, retry := s.recoveryDue(s.now())
+	return !retry
+}
+
+// recordFailure 发布失败状态：记录失败指纹、失败时间与原始错误，使后续读取在冷却
+// 窗口内继续观察到不可用，而不是把保留在内存中的旧快照误报为当前健康。
+// stamps 为 nil 表示失败发生在指纹采集阶段（dataStamps 自身失败，如目录不可读），
+// 此时 lastFailStampKnown 为 false，冷却判定不再依赖指纹比对。
+//
+// 失败日志在此单点记录，且只在状态发生变化时记一条——view() 返回的每一个错误
+// 都必然经过本函数（reload 的三个错误出口中有两个调用它，冷却期返回的
+// coolingError 是此前记录的同一根因），因此这里是「数据变为不可用」的唯一判定点。
+// 逐次记录不可行：健康探针每 30 秒一次，名单持续损坏时每次请求都记会刷出
+// 每天四万余条，把根因淹没在噪音里。
+//
+// 判据是「此前无失败记录」或「本次根因与上次不同」：恢复时 lastFailErr 被清空，
+// 因此故障与恢复的每次往复各留一条，运维既能看见问题出现，也能看见问题被修好。
+//
+// 按错误文本比较而非 errors.Is：loadStudents 每次都用 errors.New 或 fmt.Errorf
+// 新建错误值，errors.Is 永远不匹配。这里要的正是「同一年段的同一种解析失败」
+// 视为同一次故障。
+//
+// 「同一年段」这一限定现在由错误文本自身承载：loadStudents 的每个失败出口都
+// 带 %s.json 年段标识。修复前四个出口是裸 errors.New，文本里没有年段，而本注释
+// 却按「同一年段的同一种解析失败」描述比较单位——注释声称的语义与实现的比较
+// 单位不一致，两处都不是对方需要的形状。标识带上之后，一次持续不可用期间
+// 修好一份年段、同时弄坏另一份且成因相同，指纹变化越过冷却、重试、在新文件处
+// 失败、文本与上次不同，changed 为真因而补记一条；此前两种情形文本相同，
+// 零条新日志，而运维看到的是一条没有指向的成因。
+func (s *studentStore) recordFailure(stamps map[string]fileStamp, cause error) {
+	s.mu.Lock()
+	changed := s.lastFailErr == nil || s.lastFailErr.Error() != cause.Error()
+	s.lastFailStamps = stamps
+	s.lastFailStampKnown = stamps != nil
+	s.lastFailErr = cause
+	s.lastFailAt.Store(s.now().UnixMilli())
+	s.mu.Unlock()
+	if changed {
+		logErrorf("data unavailable: %v", cause)
+	}
+}
+
+// coolingError 返回冷却期内应对外暴露的错误：保留上次失败的原始原因，
+// 便于运维从 /api/search 的错误日志直接判断名单损坏的具体成因。
+// 没有记录根因时退回共享哨兵，避免每次读取分配新错误对象。
+func (s *studentStore) coolingError() error {
+	s.mu.RLock()
+	cause := s.lastFailErr
+	s.mu.RUnlock()
+	if cause == nil {
+		return errDataUnavailable
+	}
+	return cause
+}
+
+func dataStamps(dir string) (map[string]fileStamp, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	stamps := make(map[string]fileStamp, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || !isRosterFile(entry.Name()) {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return nil, err
+		}
+		stamps[filepath.Join(dir, entry.Name())] = fileStamp{size: info.Size(), modTime: info.ModTime()}
+	}
+	// 空目录守卫：至少一个 roster 文件必须存在，避免静默空跑
+	if len(stamps) == 0 {
+		return nil, errNoRoster()
+	}
+	return stamps, nil
+}
+
+func sameStamps(left, right map[string]fileStamp) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for path, stamp := range right {
+		if left[path] != stamp {
+			return false
+		}
+	}
+	return true
+}

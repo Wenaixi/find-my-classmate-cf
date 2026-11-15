@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  frontend:
+    name: 前端 · 类型检查 / 测试 / 构建
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 类型检查
+        run: npm run typecheck
+
+      - name: 单元测试
+        run: npm test
+
+      - name: 生产构建
+        run: npm run build
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-build
+          path: server/web
+          if-no-files-found: error
+
+  backend:
+    name: 后端 · 复用前端产物 / 格式化检查 / 测试 / 静态检查
+    runs-on: ubuntu-latest
+    needs: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      # web.go 的 //go:embed all:web 需要 server/web 产物。
+      # 复用 frontend job 的构建产物而非重建：前端只构建一次，
+      # 测试与编译看到的是与 CI 验证过的完全相同的字节。
+      - name: 下载前端构建产物
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-build
+          path: server/web
+
+      - name: 安装 Go 1.26
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      - name: 格式化检查
+        working-directory: server
+        run: |
+          gofmt -l .
+          test -z "$(gofmt -l .)"
+
+      - name: 单元测试
+        working-directory: server
+        run: go test -race ./...
+
+      - name: 静态检查
+        working-directory: server
+        run: go vet ./...
+
+  docker:
+    name: Docker · 镜像构建验证
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 设置 Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 构建镜像（多阶段，前端现场构建后嵌入）
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: findmyclassmate:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  data:
+    name: 数据边界守卫 · 真实名单零数据检测
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 数据边界守卫（真实名单不随仓库分发）
+        run: |
+          # 真实名单（data/*.json）不进仓库、不进发布包；仓库中不应存在任何名单数据。
+          # 数据契约由 server/data_test.go 以合成 fixture 覆盖。
+          # 真实名单形态由 TestRealRosterIsLoadable 单独把关：它读取
+          # ../data（可用 FMC_TEST_ROSTER_DIR 覆盖），无名单时跳过——
+          # 因此 CI 恒跳过，只有校内部署放置名单后该门禁才真正执行。
+          if ls data/*.json >/dev/null 2>&1; then
+            echo "错误：data/ 目录包含名单数据文件，真实名单不得随仓库分发（隐私红线）。" >&2
+            exit 1
+          fi
+          echo "零数据守卫通过：仓库无名单数据文件；名单加载契约由 server/data_test.go 覆盖。"
