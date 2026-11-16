@@ -20,8 +20,12 @@ const TOKEN = "admin-token-0123456789";
 
 // FakeRosterKV 是 RosterKV 的内存实现。entries 公开，供断言直接读键空间——
 // 「校验失败的请求没有写 KV」只能靠它看到。
+//
+// reads 累计一切 get 调用（单键与批量各算一次）：认证先于数据访问这条顺序
+// 约束只能靠「零读」断言证明，光看响应码看不出 handler 是否偷偷读了一次。
 class FakeRosterKV implements RosterKV {
   readonly entries = new Map<string, string>();
+  reads = 0;
 
   seed(key: string, value: string): void {
     this.entries.set(key, value);
@@ -33,6 +37,7 @@ class FakeRosterKV implements RosterKV {
     key: string | string[],
     _options?: RosterKVGetOptions,
   ): Promise<string | null | Map<string, string | null>> {
+    this.reads += 1;
     if (Array.isArray(key)) {
       const out = new Map<string, string | null>();
       for (const item of key) out.set(item, this.entries.get(item) ?? null);
@@ -47,6 +52,29 @@ class FakeRosterKV implements RosterKV {
 
   async delete(key: string): Promise<void> {
     this.entries.delete(key);
+  }
+}
+
+// LongKeyRejectingKV 模拟真实 KV 的键长上限（512 字节）：超过就抛错。
+// 用于证明「store 抛错 -> data_unavailable」覆盖的是全部抛错，而不只是
+// index 解析失败那一支。
+class LongKeyRejectingKV extends FakeRosterKV {
+  private static readonly KEY_LIMIT = 512;
+
+  private assertKey(key: string): void {
+    if (new TextEncoder().encode(key).length > LongKeyRejectingKV.KEY_LIMIT) {
+      throw new Error("KV rejected: key exceeds 512 bytes");
+    }
+  }
+
+  override async put(key: string, value: string): Promise<void> {
+    this.assertKey(key);
+    await super.put(key, value);
+  }
+
+  override async delete(key: string): Promise<void> {
+    this.assertKey(key);
+    await super.delete(key);
   }
 }
 
@@ -137,10 +165,28 @@ describe("verifyBearer", () => {
 
   // 未配置 token 的部署（expected 为空串）绝不放行任何请求：
   // 否则一条空的 "Bearer " 头会与空 expected 相等，管理端点变成人人可写。
+  //
+  // 前三条（空凭据、空的 "Bearer "、缺头）只证明「格式守门」有效，删掉
+  // expected 守卫它们照样全过——那是恒真断言。真正承重的是最后一条：
+  // compare 恒返回 true（模拟平台比较对任意输入都答等），若没有 expected
+  // 守卫，这里会是 true；有守卫才是 false。不注入 compare 就测不到这条。
   it("expected 为空串时任何请求都是 false，包括空 token", () => {
     expect(verifyBearer(adminRequest("/api/admin/roster", { token: "" }), "")).toBe(false);
     expect(verifyBearer(adminRequest("/api/admin/roster", { authorization: "Bearer " }), "")).toBe(false);
     expect(verifyBearer(adminRequest("/api/admin/roster"), "")).toBe(false);
+    // 承重用例：凭据格式合法、compare 恒等，唯一的拒绝理由是 expected 为空。
+    expect(verifyBearer(adminRequest("/api/admin/roster", { token: "x" }), "", () => true)).toBe(false);
+  });
+
+  // expected 为 null（不是空串）是另一条活口：TextEncoder().encode(null) 得到
+  // 4 字节的 "null" 而不是 0 字节，于是 "Authorization: Bearer null" 与之等长
+  // 全等、认证通过。装配层写 env.ADMIN_TOKEN ?? null、或测试注入 null 时，
+  // 只有 typeof 守卫能拦住它——空串守卫拦不住，长度闸门也拦不住。
+  it("expected 为 null 时一律 false，即使凭据正是字符串 null", () => {
+    const nullToken = null as unknown as string;
+    expect(verifyBearer(adminRequest("/api/admin/roster", { token: "null" }), nullToken)).toBe(false);
+    expect(verifyBearer(adminRequest("/api/admin/roster", { token: "null" }), nullToken, () => true)).toBe(false);
+    expect(verifyBearer(adminRequest("/api/admin/roster", { token: TOKEN }), nullToken)).toBe(false);
   });
 
   // 注入的 compare 是唯一比较入口：(provided, expected) 的顺序是契约，
@@ -171,6 +217,8 @@ describe("isAdminPath", () => {
 
 describe("adminHandlers 认证", () => {
   // 缺头与错 token 逐字同一响应：状态、体、头都不区分，避免以外观差异泄露原因。
+  // 三条用例共用同一次比对——整集比较 headers 而不是逐个取，任何一处
+  //（包括将来新增的头）多出差异都会翻红。
   it("缺 Authorization 头与错 token 都返回 401 unauthorized，响应逐字相同", async () => {
     const kv = seededKV();
     const ctx = adminCtx(kv);
@@ -179,21 +227,37 @@ describe("adminHandlers 认证", () => {
     const wrongToken = await adminHandlers(adminRequest("/api/admin/roster", { token: "wrong-token-here" }), ctx);
     const wrongLength = await adminHandlers(adminRequest("/api/admin/roster", { token: "short" }), ctx);
 
+    const bodies: string[] = [];
     for (const res of [missing, wrongToken, wrongLength]) {
       expect(res.status).toBe(401);
-      expect(res.headers.get("Content-Type")).toBe(jsonContentType);
-      expect(await res.json()).toEqual({ error: "unauthorized" });
+      expect(await res.text()).toBe('{"error":"unauthorized"}');
     }
+    // 整集比较：status、全部头、body 三者完全一致，缺头与错 token 无从区分。
+    for (const res of [missing, wrongToken, wrongLength]) bodies.push(JSON.stringify([res.status, [...res.headers].sort()]));
+    expect(new Set(bodies).size).toBe(1);
+
+    // RFC 7235 规定 401 应当带 WWW-Authenticate，告知客户端该用哪种 scheme。
+    expect(missing.headers.get("WWW-Authenticate")).toBe("Bearer");
   });
 
   // 认证先于方法与路径：未认证的请求不该拿到 405 / 404 这类「这个方法/这个路径
-  // 存在」的信号，也不该触发任何 KV 读。
-  it("未认证时不校验方法与路径，且不读 KV", async () => {
+  // 存在」的信号，也不该触发任何 KV 读。用满 KV 加零读断言——空 KV 上零读
+  // 可能是因为「没数据所以没读」，满 KV 上的零读才证明顺序真的是认证在前。
+  it("未认证时不校验方法与路径，且零读 KV", async () => {
     const kv = seededKV();
-    const res = await adminHandlers(adminRequest("/api/admin/roster", { method: "POST" }), adminCtx(kv));
+    const cases = [
+      adminRequest("/api/admin/roster", { method: "POST" }),
+      adminRequest(`/api/admin/roster/${encodeURIComponent("福清一中")}`, { method: "DELETE" }),
+      adminRequest("/api/admin/roster/不存在的校名", { method: "PUT", body: "{}" }),
+    ];
 
-    expect(res.status).toBe(401);
-    expect(res.headers.get("Allow")).toBeNull();
+    for (const request of cases) {
+      const res = await adminHandlers(request, adminCtx(kv));
+      expect(res.status, request.method).toBe(401);
+      expect(res.headers.get("Allow")).toBeNull();
+    }
+
+    expect(kv.reads).toBe(0);
     expect(kv.entries.get(rosterIndexKey)).toBe(JSON.stringify(["福清一中"]));
   });
 });
@@ -321,6 +385,133 @@ describe("adminHandlers PUT", () => {
 
     expect(res.status).toBe(404);
     expect(await res.json()).toEqual({ error: "not_found" });
+  });
+
+  // 路径段里的控制字符（如 %00 解出 \u0000）必须拒绝：NUL 正是 shared/roster.ts
+  // 用来拼去重键的分隔符（KEY_SEPARATOR），含 NUL 的校名会让「两段拼起来相同但
+  // 分段不同」的记录无法区分。它同时也会让 index 里出现不可见字符，肉眼对不上。
+  it("含控制字符的路径段返回 400 invalid_roster，且不写 KV", async () => {
+    const kv = new FakeRosterKV();
+    const res = await adminHandlers(
+      adminRequest("/api/admin/roster/%00", { method: "PUT", token: TOKEN, body: rosterJson("x", "高一", { "1班": ["y"] }) }),
+      adminCtx(kv),
+    );
+
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toBe("invalid_roster");
+    expect(kv.entries.size).toBe(0);
+  });
+});
+
+// C-1：校名 index 与索引键 roster:index 撞名。rosterKey("index") 恰好等于
+// rosterIndexKey——「roster:」前缀是校名的命名空间，而索引本身住在里面，
+// 是那个命名空间里唯一的保留成员。管理端是唯一能提交任意校名的入口，因此
+// 这条边界必须在这里之前就由存储层守住，而不是指望调用点不来。
+//
+// 撞名的后果不可逆且无告警，两条路径都是数据销毁：
+//   PUT  .../index 把整份名单原文写进 roster:index → index 不再是学校名数组，
+//                   下一次 GET 解析失败答 500，loadAll 全站失败；
+//   DELETE .../index 删掉 roster:index → 其余学校原文成孤儿，GET 答
+//                   {"schools":[]}，伪装成「从没上传过」，管理员查不出根因。
+// 响应还会与副作用完全相反：PUT 答 400「名单内容不合法」，管理员以为重传即可。
+describe("保留校名 index 不可作为目标（C-1）", () => {
+  const encodedIndex = encodeURIComponent("index");
+
+  it("PUT 校名 index 返回 400，index 与 KV 均未被改动", async () => {
+    const kv = seededKV();
+    const payload = rosterJson("index", "高一", { "1班": ["张伟"] });
+
+    const res = await adminHandlers(
+      adminRequest(`/api/admin/roster/${encodedIndex}`, { method: "PUT", token: TOKEN, body: payload }),
+      adminCtx(kv),
+    );
+
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toBe("invalid_roster");
+    expect(body.message).toContain("保留");
+    // 数据销毁的判据：index 仍是原来的学校名数组，且没有多出任何键。
+    expect(kv.entries.get(rosterIndexKey)).toBe(JSON.stringify(["福清一中"]));
+    expect(kv.entries.size).toBe(2);
+  });
+
+  it("DELETE 校名 index 返回 400，index 未被删除", async () => {
+    const kv = seededKV();
+
+    const res = await adminHandlers(
+      adminRequest(`/api/admin/roster/${encodedIndex}`, { method: "DELETE", token: TOKEN }),
+      adminCtx(kv),
+    );
+
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toBe("invalid_roster");
+    // 关键断言：index 键必须还在，否则其余学校原文全成孤儿。
+    expect(kv.entries.get(rosterIndexKey)).toBe(JSON.stringify(["福清一中"]));
+    expect(kv.entries.get(rosterKey("福清一中"))).not.toBeUndefined();
+  });
+
+  // 编码形态绕不过去：解码后落键形态相同，判定必须在归一之后。
+  it("编码形态 ind%65x 同样被拒绝", async () => {
+    const kv = seededKV();
+    const payload = rosterJson("index", "高一", { "1班": ["张伟"] });
+
+    const res = await adminHandlers(
+      adminRequest("/api/admin/roster/ind%65x", { method: "PUT", token: TOKEN, body: payload }),
+      adminCtx(kv),
+    );
+
+    expect(res.status).toBe(400);
+    expect(kv.entries.get(rosterIndexKey)).toBe(JSON.stringify(["福清一中"]));
+  });
+
+  // 校名判定在剥空白之后：带空白的 " index " 归一后同样是保留名。
+  it("带前后空白的 index 同样被拒绝", async () => {
+    const kv = seededKV();
+    const res = await adminHandlers(
+      adminRequest(`/api/admin/roster/${encodeURIComponent("  index  ")}`, { method: "DELETE", token: TOKEN }),
+      adminCtx(kv),
+    );
+
+    expect(res.status).toBe(400);
+    expect(kv.entries.get(rosterIndexKey)).toBe(JSON.stringify(["福清一中"]));
+  });
+});
+
+describe("adminHandlers DELETE 的错误处置（I-2）", () => {
+  // index 损坏时 DELETE 必须与 GET 列表同答 500 data_unavailable，而不是把
+  // 异常冒泡成货真价实的 500 或另一套错误码。同一份「index 坏了」在 GET 得
+  // data_unavailable（说「去修数据」）、在这里若得别的码（说「这是代码 bug」），
+  // 排障方向就被引偏一层。
+  it("index 损坏返回 500 data_unavailable，与 GET 列表同码", async () => {
+    const kv = new FakeRosterKV();
+    kv.seed(rosterIndexKey, "不是 JSON");
+
+    const res = await adminHandlers(
+      adminRequest(`/api/admin/roster/${encodeURIComponent("福清一中")}`, { method: "DELETE", token: TOKEN }),
+      adminCtx(kv),
+    );
+
+    expect(res.status).toBe(500);
+    expect(res.headers.get("Content-Type")).toBe(jsonContentType);
+    expect(await res.json()).toEqual({ error: "data_unavailable" });
+  });
+
+  // 触发面比「index 损坏」宽：KV 对键长有上限（512 字节），超长校名会让
+  // delete 本身抛错。这条同样必须翻译成 data_unavailable 而不是裸 500——
+  // 用它证明 catch 覆盖的是 store 的一切抛错，而不只是 index 解析失败这一支。
+  it("超长校名导致 KV 拒删时返回 500 data_unavailable", async () => {
+    // 用一个会拒绝超长键的 KV：真实 KV 对 512 字节以上的键直接报错。
+    const kv = new LongKeyRejectingKV();
+    kv.seed(rosterIndexKey, JSON.stringify(["福清一中"]));
+
+    const res = await adminHandlers(
+      adminRequest(`/api/admin/roster/${encodeURIComponent("症".repeat(200))}`, { method: "DELETE", token: TOKEN }),
+      adminCtx(kv),
+    );
+
+    expect(res.status).toBe(500);
+    expect(res.headers.get("Content-Type")).toBe(jsonContentType);
+    expect(await res.json()).toEqual({ error: "data_unavailable" });
   });
 });
 

@@ -312,6 +312,61 @@ describe("putRoster", () => {
   });
 });
 
+// 保留名校名 index 是本层必须守的键空间边界，不是管理端该记得的事：
+// rosterKey("index") === rosterIndexKey，校名取 index 就能把名单原文写进索引键。
+// 守卫在 normalizeSchoolName 里（落键归一之后），因此编码形态与带空白的
+// " index " 都会被同一条判定拦下。
+//
+// 这些用例锁的是根因层，不依赖管理端是否记得检查——管理端将来换了实现、
+// 或有人直接调 store，都不会绕过它。
+describe("保留校名 index 拒绝（C-1 根因层）", () => {
+  it("putRoster 拒绝 index，不产生任何 KV 动作，index 不被覆盖", async () => {
+    const kv = new FakeRosterKV();
+    kv.seed(rosterIndexKey, JSON.stringify(["福清一中"]));
+    const payload = rosterJson("index", "高一", { "1班": ["张三"] });
+
+    await expect(new RosterStore(kv).putRoster("index", payload)).rejects.toThrow(/保留字 index/);
+    // 关键：一个字节都没落 KV，索引仍是原来的学校名数组。
+    expect(kv.puts).toEqual([]);
+    expect(kv.peek(rosterIndexKey)).toBe(JSON.stringify(["福清一中"]));
+    // roster:index 既是索引键也是 rosterKey("index") 本身，覆盖与否看同一个键。
+    expect(kv.peek(rosterKey("index"))).toBe(JSON.stringify(["福清一中"]));
+  });
+
+  it("deleteRoster 拒绝 index，index 键不被删除", async () => {
+    const kv = new FakeRosterKV();
+    kv.seed(rosterIndexKey, JSON.stringify(["福清一中"]));
+    kv.seed(rosterKey("福清一中"), rosterJson("福清一中", "高一", { "1班": ["张三"] }));
+
+    await expect(new RosterStore(kv).deleteRoster("index")).rejects.toThrow(/保留字 index/);
+    // 关键：索引与其余学校原文都还在，没有变成孤儿。
+    expect(kv.deletes).toEqual([]);
+    expect(kv.peek(rosterIndexKey)).toBe(JSON.stringify(["福清一中"]));
+    expect(kv.peek(rosterKey("福清一中"))).not.toBeNull();
+  });
+
+  // 带前后空白的 index 归一后同样是保留名：判定必须在归一之后。
+  it("带空白的 index 与编码形态都走同一条判定", async () => {
+    const kv = new FakeRosterKV();
+    const store = new RosterStore(kv);
+    const payload = rosterJson("index", "高一", { "1班": ["张三"] });
+
+    await expect(store.putRoster("  index  ", payload)).rejects.toThrow(/保留字 index/);
+    await expect(store.putRoster("\tindex\n", payload)).rejects.toThrow(/保留字 index/);
+    expect(kv.puts).toEqual([]);
+  });
+
+  // 控制字符（NUL 正是去重键的分隔符）同样拒绝。
+  it("含控制字符的校名被拒绝", async () => {
+    const kv = new FakeRosterKV();
+    const payload = rosterJson("x", "高一", { "1班": ["张三"] });
+
+    await expect(new RosterStore(kv).putRoster("福清\u0000一中", payload)).rejects.toThrow(/控制字符/);
+    await expect(new RosterStore(kv).putRoster("福清\u001f一中", payload)).rejects.toThrow(/控制字符/);
+    expect(kv.puts).toEqual([]);
+  });
+});
+
 describe("deleteRoster", () => {
   it("删除 roster key 并从 index 移除该校，返回 true", async () => {
     const kv = new FakeRosterKV();

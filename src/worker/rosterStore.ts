@@ -68,6 +68,21 @@ export function rosterKey(school: string): string {
   return `roster:${school}`;
 }
 
+// InvalidSchoolNameError 标记「校名本身不合法」这一类拒绝：空名、保留名 index、
+// 含控制字符。它与「名单原文校验失败」是两种不同的事实，管理端必须能分开——
+// 前者是请求的问题（改 URL 重发即可），后者是上传内容的问题（改文件重发）。
+// 两者都返回 400，但 DELETE 路径上只有后者不该被当成「数据坏了」去翻 KV。
+//
+// 用独立类型而不是给 Error 加字段：instanceof 判定让 handler 不必去解析
+// message 文本，message 的 owner 因此仍只属于抛出处——文案改动不会让
+// 分类逻辑静默失效。
+export class InvalidSchoolNameError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "InvalidSchoolNameError";
+  }
+}
+
 // READ_OPTIONS 抽出共用，避免四个读取点各写一份字面量后悄悄分叉
 // （例如某处漏了 cacheTtl，读数就不再走边缘缓存，计费与延迟都变）。
 //
@@ -235,7 +250,8 @@ export class RosterStore {
   }
 }
 
-// normalizeSchoolName 把校名归一到落键形态：剥掉 Go 语义的空白，并拒绝空名。
+// normalizeSchoolName 把校名归一到落键形态：剥掉 Go 语义的空白，并拒绝空名、
+// 保留名与含控制字符的名字。
 //
 // 用 trimGoSpace 而不是 String.prototype.trim 与校验侧保持同一份空白语义
 // （后者会剥 U+FEFF 而 Go 不剥，两端会分叉）。
@@ -248,7 +264,31 @@ function normalizeSchoolName(school: string): string {
   if (name === "") {
     // 空校名落键会得到 roster: 这个无意义的键，且 index 里出现空串项——
     // 下拉里会渲染出一个空选项（等价于「不按学校过滤」的歧义入口）。
-    throw new Error("校名不能为空");
+    throw new InvalidSchoolNameError("校名不能为空");
+  }
+  // 「roster:」前缀是校名独占的键空间，而索引键 roster:index 正是它的保留成员：
+  // rosterKey("index") === rosterIndexKey。校名若取 index，PUT 会把名单原文
+  // 写进索引键（下一次加载解析失败、全站 500），DELETE 会把索引整个删掉
+  //（其余学校原文成孤儿，列表答「一所都没上传」，管理员查不出根因）。
+  // 两条都是不可逆的数据销毁，且响应与副作用相反——PUT 会答「名单内容不合法」，
+  // 管理员以为重传即可。
+  //
+  // 判定必须在归一之后：编码形态（ind%65x）与带空白的 " index " 都落到这个
+  // 名字上，任何在归一之前做的检查都能被绕过。
+  //
+  // 用常量比较而不是字面量 "index"：这个保留名的唯一事实源是 rosterIndexKey
+  // 的构成方式（"roster:" + 名字 === rosterIndexKey），写成字面量会在将来
+  // 改前缀或改索引键时静默失配。
+  if (rosterKey(name) === rosterIndexKey) {
+    throw new InvalidSchoolNameError("校名不能是保留字 index");
+  }
+  // 控制字符一并拒绝：NUL 是 shared/roster.ts 拼去重键的分隔符（KEY_SEPARATOR），
+  // 含 NUL 的校名会让「两段拼起来相同但分段不同」的记录无法区分；其余控制字符
+  // 只可能来自手工构造的请求，任何一种都会让键名与运维看到的文本对不上。
+  for (const rune of name) {
+    if (rune < " " || rune === "\u007f") {
+      throw new InvalidSchoolNameError("校名不能含控制字符");
+    }
   }
   return name;
 }

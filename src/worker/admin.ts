@@ -24,7 +24,7 @@
 // Allow 回答会让运维拿着 Allow: GET 去 PUT 单项路径，而那条路径明确支持 PUT。
 import { trimGoSpace } from "../shared/classparse";
 import { ERR_CODES, writeError, writeJSON } from "./errors";
-import type { RosterStore } from "./rosterStore";
+import { InvalidSchoolNameError, type RosterStore } from "./rosterStore";
 
 // 401 的错误码。不进 ERR_CODES：理由见文件头（仅管理端使用）。
 const ERR_UNAUTHORIZED = "unauthorized";
@@ -118,8 +118,15 @@ export type CredentialCompare = (provided: string, expected: string) => boolean;
 // 空 expected 一律拒绝：部署若漏配 ADMIN_TOKEN（secret 缺失时读出空串），
 // 空 expected 与一条空的 Bearer 凭据相等会让管理端点变成人人可写。
 // 这条守卫放在比较之前，任何 compare 实现都绕不过去。
+//
+// 类型守卫必须先于空串判定，且必须写成 typeof 而不是 == null：
+// TextEncoder().encode(null) 得到 4 字节的 "null"（不是 0 字节），于是
+// "Authorization: Bearer null" 与 null 等长全等、认证直接通过；undefined
+// 才得 0 字节、被长度闸门兜住。装配层写 env.ADMIN_TOKEN ?? null、或测试
+// 注入 null 时，只有 typeof 能拦住这类活口。签名收 string，这个判定是为
+// 「调用点绕过类型」的真实场景准备的。
 export function verifyBearer(request: Request, expected: string, compare: CredentialCompare = constantTimeEqual): boolean {
-  if (expected === "") return false;
+  if (typeof expected !== "string" || expected === "") return false;
   const header = request.headers.get("Authorization");
   if (header === null) return false;
   const match = BEARER_PATTERN.exec(header);
@@ -163,14 +170,22 @@ function decodeSchool(segment: string): string | null {
 
 // unauthorized 是认证失败的唯一响应形态。缺头、格式不对、token 错都走它，
 // 三者的响应逐字相同（同状态、同体、同头），因此无法从中反推原因。
+//
+// 带 WWW-Authenticate: Bearer：RFC 7235 要求 401 用这个头告知客户端该用哪种
+// 认证方案，客户端与运维工具（curl -u 之外的一切）都按它提示重试。它是常量，
+// 不随失败原因变化，因此不影响「三条失败路径逐字相同」这条约束。
 function unauthorized(): Response {
-  return writeJSON(401, { error: ERR_UNAUTHORIZED });
+  return writeJSON(401, { error: ERR_UNAUTHORIZED }, { "WWW-Authenticate": "Bearer" });
 }
 
 // rosterValidationFailed 把加载侧的校验错误转成 400：码固定 invalid_roster，
 // message 逐字沿用 shared/roster.ts 的文案（带来源名/校名/年级名，运维据此
 // 定位到上传文件里的哪一层）。本文件不加前缀、不改写——文案的 owner 是校验层，
 // 这里只是搬运。
+//
+// 校名不合法（空名/保留名 index/含控制字符）同样落到这个码上：对客户端而言
+// 「这次请求给的校名不能用」与「上传的名单不能用」都是要改请求重发，码相同
+// 不损失信息，文案已经把具体原因说清楚了。
 //
 // ponytail: 这里把 putRoster 抛出的所有错误都算校验失败，包括 KV 写失败。
 // 两者的区分需要存储层自带错误分类，而当前管理端是单管理员低频写入，
@@ -248,14 +263,30 @@ export async function adminHandlers(request: Request, ctx: AdminContext): Promis
   }
 
   if (request.method === "DELETE") {
-    const deleted = await ctx.store.deleteRoster(school);
-    // deleteRoster 返回「该校是否在 index 里」：false 表示这所学校从未上传
-    //（或已被删除），对管理员是「目标不存在」，答 404 而不是 200 幂等成功——
-    // 拼错校名的 DELETE 若答 200，管理员会以为删掉了一所实际还在的学校。
-    if (!deleted) {
-      return writeError(ERR_CODES.notFound);
+    // 与 GET 列表同形：store 抛错一律翻译成 data_unavailable。
+    //
+    // 触发面比想象中宽——不只 index 内容损坏：超长校名在真实 KV 上会因键长
+    // 超限而抛错，而 DELETE 若让它冒泡，同一份「存储层拒绝了这个动作」在
+    // GET 得 data_unavailable（说「去修数据」）、在这里得 500 空体（说
+    //「这是代码 bug」），排障方向被引偏一层。两处同码才让人往同一处找。
+    //
+    // 校名不合法（保留名 index、含控制字符）不是数据问题：InvalidSchoolNameError
+    // 由存储层抛在读写之前，它答 400（改请求重发），不走 500。
+    try {
+      const deleted = await ctx.store.deleteRoster(school);
+      // deleteRoster 返回「该校是否在 index 里」：false 表示这所学校从未上传
+      //（或已被删除），对管理员是「目标不存在」，答 404 而不是 200 幂等成功——
+      // 拼错校名的 DELETE 若答 200，管理员会以为删掉了一所实际还在的学校。
+      if (!deleted) {
+        return writeError(ERR_CODES.notFound);
+      }
+      return writeJSON(200, { deleted: true });
+    } catch (error) {
+      if (error instanceof InvalidSchoolNameError) {
+        return rosterValidationFailed(error);
+      }
+      return writeError(ERR_CODES.dataUnavailable);
     }
-    return writeJSON(200, { deleted: true });
   }
 
   // 单项路径只接受 PUT / DELETE。Allow 逐字列出两者而不是笼统的 "PUT, DELETE"
