@@ -112,7 +112,19 @@ export type ClassNumberResult =
 // normalizeName 由本文件导出后再经 query.ts re-export，两处都不持有副本。
 const goSpaceChars = "\\t\\n\\v\\f\\r \\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000";
 const goSpace = new RegExp("[" + goSpaceChars + "]", "g");
+// goSpaceTrim 是首尾剥除用的正则；normalizeName 与数据加载侧共用同一份字符集。
 const goSpaceTrim = new RegExp("^[" + goSpaceChars + "]+|[" + goSpaceChars + "]+$", "g");
+
+// trimGoSpace 与 Go 端 strings.TrimSpace 同义：只剥除首尾的 Go 空白集合成员，
+// 不剥 U+FEFF（它不在 Go 的 White_Space 内，与 JS 的 String.prototype.trim 相反）。
+//
+// 数据加载侧（shared/roster.ts）判定校名/年级名/班名是否为空必须用它，而不是
+// value.trim()：后者会剥掉 U+FEFF，把「␣<U+FEFF>福清一中␣」判成有校名的一侧，
+// 而 Go 端同样输入会剥成「<U+FEFF>福清一中」——两端对「空校名」的判定因此分叉。
+// 数据路径的拒绝文案是运维排障的入口，分叉必须消灭在单一 owner。
+export function trimGoSpace(value: string): string {
+  return value.replace(goSpaceTrim, "");
+}
 
 // goSpaceSplit 是查询分词的切分正则，与 Go 端 strings.Fields 的切分集合对齐。
 // 不导出字符集本身：消费方只该拿到「怎么切」，字符集与它的理由留在本文件。
