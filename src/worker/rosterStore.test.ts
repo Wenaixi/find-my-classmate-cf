@@ -21,7 +21,9 @@ import { RosterStore, rosterIndexKey, rosterKey, type RosterKV, type RosterKVGet
 // 读取动作同样记录，用于确认 loadAll 走的是批量读而非逐 key 读——逐 key 读
 // 在上千所学校时会撞 Workers 的每次请求 subrequest 限额，而批量读只算一次。
 class FakeRosterKV implements RosterKV {
-  private readonly entries = new Map<string, string>();
+  // entries 不设为 private：它有 peek 这个读取入口，但「键空间为空」这类
+  // 断言要直接看整体，遍历 peek 只是绕一圈。
+  readonly entries = new Map<string, string>();
   readonly puts: Array<{ key: string; value: string }> = [];
   readonly deletes: string[] = [];
   readonly singleReads: string[] = [];
@@ -364,6 +366,47 @@ describe("保留校名 index 拒绝（C-1 根因层）", () => {
     await expect(new RosterStore(kv).putRoster("福清\u0000一中", payload)).rejects.toThrow(/控制字符/);
     await expect(new RosterStore(kv).putRoster("福清\u001f一中", payload)).rejects.toThrow(/控制字符/);
     expect(kv.puts).toEqual([]);
+  });
+});
+
+// 键名 512 字节是 KV 的硬限制，越界时平台会抛自己的错误——那条文本若流到
+// 客户端，会被读成「你上传的名单内容不合法」，而真实原因是这个校名太长。
+// 拦截前置在本层，用 rosterKey(name) 的字节数判定（前缀也算额度），
+// 于是 PUT 与 DELETE 拿到同一件事：「这个校名不能用」。
+describe("键长上限前置（根因层）", () => {
+  // "roster:" 是 7 个 ASCII 字符：校名 505 字节时键名恰好 512（允许），
+  // 506 字节时 513（拒绝）。
+  const atLimit = "a".repeat(505);
+  const overLimit = "a".repeat(506);
+
+  it("恰好 512 字节允许落键", async () => {
+    const kv = new FakeRosterKV();
+    await new RosterStore(kv).putRoster(atLimit, rosterJson(atLimit, "高一", { "1班": ["张三"] }));
+
+    expect(kv.peek(rosterKey(atLimit))).not.toBeNull();
+  });
+
+  it("超过 512 字节抛 InvalidSchoolNameError，一个字节都不落 KV", async () => {
+    const kv = new FakeRosterKV();
+    const payload = rosterJson(overLimit, "高一", { "1班": ["张三"] });
+
+    await expect(new RosterStore(kv).putRoster(overLimit, payload)).rejects.toThrow(/校名过长/);
+    expect(kv.puts).toEqual([]);
+    expect(kv.entries.size).toBe(0);
+  });
+
+  // 汉字按 UTF-8 计三字节：200 个汉字是 600 字节，加前缀 607，远超 512。
+  // 用码元或码点数近似都会漏判（200 个汉字在 JS 里 length 也是 200）。
+  it("汉字校名按 UTF-8 字节判定，不按字符数", async () => {
+    const kv = new FakeRosterKV();
+    const longName = "症".repeat(200);
+
+    await expect(new RosterStore(kv).putRoster(longName, rosterJson(longName, "高一", { "1班": ["张三"] }))).rejects.toThrow(
+      /校名过长/,
+    );
+    await expect(new RosterStore(kv).deleteRoster(longName)).rejects.toThrow(/校名过长/);
+    expect(kv.puts).toEqual([]);
+    expect(kv.deletes).toEqual([]);
   });
 });
 

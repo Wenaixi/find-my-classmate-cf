@@ -24,7 +24,7 @@
 // Allow 回答会让运维拿着 Allow: GET 去 PUT 单项路径，而那条路径明确支持 PUT。
 import { trimGoSpace } from "../shared/classparse";
 import { ERR_CODES, writeError, writeJSON } from "./errors";
-import { InvalidSchoolNameError, type RosterStore } from "./rosterStore";
+import { InvalidRosterError, InvalidSchoolNameError, type RosterStore } from "./rosterStore";
 
 // 401 的错误码。不进 ERR_CODES：理由见文件头（仅管理端使用）。
 const ERR_UNAUTHORIZED = "unauthorized";
@@ -258,7 +258,22 @@ export async function adminHandlers(request: Request, ctx: AdminContext): Promis
       //（trimGoSpace）算出回显值，不重新实现落键。
       return writeJSON(201, { school: trimGoSpace(school), students });
     } catch (error) {
-      return rosterValidationFailed(error);
+      // 两类「客户端可修」的失败都答 400，但必须与存储故障分开：
+      //
+      // 1. 校名不合法（空名/保留名 index/控制字符/键名超长）：由存储层在读写
+      //    之前抛出，KV 还没被动过。message 是「这个校名不能用」。
+      // 2. 名单内容不合法：parseSingleDocument 在第一次 kv.put 之前完成，
+      //    抛出的 message 是 shared/roster.ts 的应届文案（带来源名/校名/年级名），
+      //    运维据此定位到上传文件里的哪一层。
+      //
+      // 其余一律是存储故障。它绝不能走 400：平台的错误文本（键值超限、限流、
+      // 超时）会被原样塞进 message，把「存储层写失败」标注成「你上传的内容
+      // 不合法」——管理员拿着好文件反复重传，排障方向被引偏，同时内部错误
+      // 文本外露给客户端。这里与 GET 列表同答 data_unavailable。
+      if (error instanceof InvalidSchoolNameError || error instanceof InvalidRosterError) {
+        return rosterValidationFailed(error);
+      }
+      return writeError(ERR_CODES.dataUnavailable);
     }
   }
 
@@ -282,6 +297,8 @@ export async function adminHandlers(request: Request, ctx: AdminContext): Promis
       }
       return writeJSON(200, { deleted: true });
     } catch (error) {
+      // 校名不合法（保留名 index、含控制字符、键名超长）不是数据问题：
+      // 它由存储层抛在读写之前，答 400（改请求重发），不走 500。
       if (error instanceof InvalidSchoolNameError) {
         return rosterValidationFailed(error);
       }

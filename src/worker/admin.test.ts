@@ -55,26 +55,27 @@ class FakeRosterKV implements RosterKV {
   }
 }
 
-// LongKeyRejectingKV 模拟真实 KV 的键长上限（512 字节）：超过就抛错。
-// 用于证明「store 抛错 -> data_unavailable」覆盖的是全部抛错，而不只是
-// index 解析失败那一支。
-class LongKeyRejectingKV extends FakeRosterKV {
-  private static readonly KEY_LIMIT = 512;
-
-  private assertKey(key: string): void {
-    if (new TextEncoder().encode(key).length > LongKeyRejectingKV.KEY_LIMIT) {
-      throw new Error("KV rejected: key exceeds 512 bytes");
+// IndexReadFailingKV 让读 index 直接抛错，模拟 KV 自身故障（超时、限流、
+// 后端错误）而不是「index 内容损坏」。
+//
+// 它与「index 内容损坏」是两个不同的抛错源：后者是 parseSchoolIndex 解析
+// 失败，前者根本不进解析。用它证明 handler 的 catch 覆盖的是 store 的一切
+// 抛错，而不只是解析失败那一支——若 catch 只认某一种错误，这里会翻红。
+class IndexReadFailingKV extends FakeRosterKV {
+  override async get(key: string, options?: RosterKVGetOptions): Promise<string | null>;
+  override async get(keys: string[], options?: RosterKVGetOptions): Promise<Map<string, string | null>>;
+  override async get(
+    key: string | string[],
+    options?: RosterKVGetOptions,
+  ): Promise<string | null | Map<string, string | null>> {
+    if (!Array.isArray(key) && key === rosterIndexKey) {
+      throw new Error("KV get failed: upstream timeout");
     }
-  }
-
-  override async put(key: string, value: string): Promise<void> {
-    this.assertKey(key);
-    await super.put(key, value);
-  }
-
-  override async delete(key: string): Promise<void> {
-    this.assertKey(key);
-    await super.delete(key);
+    if (Array.isArray(key)) {
+      // 批量读取分支显式走父类的数组重载，避免把联合类型原样传回去。
+      return super.get(key, options);
+    }
+    return super.get(key, options);
   }
 }
 
@@ -496,22 +497,97 @@ describe("adminHandlers DELETE 的错误处置（I-2）", () => {
     expect(await res.json()).toEqual({ error: "data_unavailable" });
   });
 
-  // 触发面比「index 损坏」宽：KV 对键长有上限（512 字节），超长校名会让
-  // delete 本身抛错。这条同样必须翻译成 data_unavailable 而不是裸 500——
-  // 用它证明 catch 覆盖的是 store 的一切抛错，而不只是 index 解析失败这一支。
-  it("超长校名导致 KV 拒删时返回 500 data_unavailable", async () => {
-    // 用一个会拒绝超长键的 KV：真实 KV 对 512 字节以上的键直接报错。
-    const kv = new LongKeyRejectingKV();
+  // 抛错源换成「KV 自身故障」（读 index 直接抛），而不是「校名超长」：
+  // 校名超长已由键长上限前置成 400（见下方用例），用它证明 catch 覆盖一切
+  // 抛错会把「输入不合法」错锁成「存储故障」契约。这里要证明的恰恰是另一面——
+  // 真正的存储故障仍然翻译成 data_unavailable，且不冒泡。
+  it("KV 读 index 自身抛错时返回 500 data_unavailable", async () => {
+    const kv = new IndexReadFailingKV();
     kv.seed(rosterIndexKey, JSON.stringify(["福清一中"]));
 
     const res = await adminHandlers(
-      adminRequest(`/api/admin/roster/${encodeURIComponent("症".repeat(200))}`, { method: "DELETE", token: TOKEN }),
+      adminRequest(`/api/admin/roster/${encodeURIComponent("福清一中")}`, { method: "DELETE", token: TOKEN }),
       adminCtx(kv),
     );
 
     expect(res.status).toBe(500);
     expect(res.headers.get("Content-Type")).toBe(jsonContentType);
     expect(await res.json()).toEqual({ error: "data_unavailable" });
+  });
+});
+
+// 长校名是输入不合法，不是存储故障。两条方法必须答同一件事（400），
+// 理由也必须是同一句「校名不合法」——而不是 PUT 得一条 KV 原始报错、
+// DELETE 得 500。
+//
+// 判定收在 rosterStore.normalizeSchoolName 的键长上限里，与真实 KV 的
+// 512 字节键长限制同源（用 rosterKey(name) 的字节数算，不是校名字节数：
+// 前缀 "roster:" 也占额度）。
+describe("长校名的处置（PUT 与 DELETE 对称）", () => {
+  // 200 个汉字在 UTF-8 下是 600 字节，加 "roster:" 前缀后远超 512。
+  const longName = "症".repeat(200);
+  const longPath = `/api/admin/roster/${encodeURIComponent(longName)}`;
+
+  it("PUT 长校名返回 400 invalid_roster，message 是校名不合法而非 KV 原始文本", async () => {
+    const kv = new FakeRosterKV();
+    const res = await adminHandlers(
+      adminRequest(longPath, { method: "PUT", token: TOKEN, body: rosterJson(longName, "高一", { "1班": ["张伟"] }) }),
+      adminCtx(kv),
+    );
+
+    expect(res.status).toBe(400);
+    expect(res.headers.get("Content-Type")).toBe(jsonContentType);
+    const body = await res.json();
+    expect(body.error).toBe("invalid_roster");
+    expect(body.message).toContain("校名过长");
+    // 语义错标的判据：存储层的原始报错文本不得出现在客户端响应里。
+    expect(body.message).not.toContain("KV");
+    expect(body.message).not.toContain("512 bytes");
+    expect(kv.entries.size).toBe(0);
+  });
+
+  it("DELETE 长校名返回 400 invalid_roster，与 PUT 逐字同一响应", async () => {
+    const kv = seededKV();
+    const res = await adminHandlers(adminRequest(longPath, { method: "DELETE", token: TOKEN }), adminCtx(kv));
+
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toBe("invalid_roster");
+    expect(body.message).toContain("校名过长");
+
+    // 对称性：同一输入在两条方法上给出逐字相同的响应体。
+    const putRes = await adminHandlers(
+      adminRequest(longPath, { method: "PUT", token: TOKEN, body: rosterJson(longName, "高一", { "1班": ["张伟"] }) }),
+      adminCtx(new FakeRosterKV()),
+    );
+    expect(await putRes.text()).toBe(JSON.stringify(body));
+    // 原有数据未被改动。
+    expect(kv.entries.get(rosterIndexKey)).toBe(JSON.stringify(["福清一中"]));
+  });
+
+  // 边界：恰好 512 字节的键名允许写入。用 ASCII 校名把字节数算得精确——
+  // "roster:" 是 7 个 ASCII 字符，因此校名取 505 个 ASCII 字符即恰好 512
+  // 字节，506 个即 513 字节、越界一字节。
+  it("键名恰好 512 字节允许写入，超一字节即拒绝", async () => {
+    const atLimit = "a".repeat(505);
+    const overLimit = "a".repeat(506);
+
+    const okKv = new FakeRosterKV();
+    const okRes = await adminHandlers(
+      adminRequest(`/api/admin/roster/${atLimit}`, { method: "PUT", token: TOKEN, body: rosterJson(atLimit, "高一", { "1班": ["张伟"] }) }),
+      adminCtx(okKv),
+    );
+    expect(okRes.status).toBe(201);
+    expect(okKv.entries.get(rosterKey(atLimit))).not.toBeUndefined();
+
+    const overKv = new FakeRosterKV();
+    const overRes = await adminHandlers(
+      adminRequest(`/api/admin/roster/${overLimit}`, { method: "PUT", token: TOKEN, body: rosterJson(overLimit, "高一", { "1班": ["张伟"] }) }),
+      adminCtx(overKv),
+    );
+    expect(overRes.status).toBe(400);
+    expect((await overRes.json()).message).toContain("校名过长");
+    expect(overKv.entries.size).toBe(0);
   });
 });
 

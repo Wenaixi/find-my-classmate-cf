@@ -83,6 +83,23 @@ export class InvalidSchoolNameError extends Error {
   }
 }
 
+// InvalidRosterError 标记「名单原文没有通过加载侧校验」，message 逐字沿用
+// shared/roster.ts 的文案（本层不加工）。它与 InvalidSchoolNameError 一起，
+// 让管理端无需解析文本就能分出三类事实：
+//
+//   InvalidSchoolNameError  校名不合法（空名/保留名/控制字符/键名超长）→ 400
+//   InvalidRosterError      名单内容不合法（解析/结构/班级格式等）→ 400 + 文案
+//   其他                      存储层故障（KV 读写抛错）→ 500 data_unavailable
+//
+// 第三种最关键：平台抛出的错误文本（键值超限、限流、超时）若被当成「内容
+// 不合法」转发，管理员会拿着好文件反复重传，同时内部错误文本外露。
+export class InvalidRosterError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "InvalidRosterError";
+  }
+}
+
 // READ_OPTIONS 抽出共用，避免四个读取点各写一份字面量后悄悄分叉
 // （例如某处漏了 cacheTtl，读数就不再走边缘缓存，计费与延迟都变）。
 //
@@ -92,6 +109,12 @@ export class InvalidSchoolNameError extends Error {
 // 代价是「刚写入的名单在别的 colo 上最多晚 60 秒可见」，而这个代价直接
 // 放大了下面 putRoster / deleteRoster 的读-改-写竞态窗口，见其标注。
 const READ_OPTIONS: RosterKVGetOptions = { type: "text", cacheTtl: 60 };
+
+// ROSTER_KEY_MAX_BYTES 是 KV 键名的字节上限，来自平台文档的硬限制
+//（https://developers.cloudflare.com/kv/platform/limits/：Key size 512 bytes，
+// Free 与 Paid 相同）。写成具名常量而不是散落字面量：它同时被输入校验与
+// 错误文案引用，两处必须永远同一个数。
+const ROSTER_KEY_MAX_BYTES = 512;
 
 // RosterStore 是名单的读取与写入入口。一个实例对应一组 KV 绑定，
 // 生命周期与当前请求一致：本层不持有任何跨请求缓存——名单的一致性
@@ -186,9 +209,19 @@ export class RosterStore {
   // 一份只活一行的加载态。
   async putRoster(school: string, payload: string): Promise<{ students: number }> {
     const name = normalizeSchoolName(school);
-    // 校验异常直接向上抛：调用方（管理端 handler）把 message 原样转成 400，
-    // 文案必须保持 shared/roster.ts 的逐字形态，本层不加前缀不改写。
-    const students = parseSingleDocument(payload, name);
+    // 校验异常向上抛，message 保持 shared/roster.ts 的逐字形态，本层不加前缀
+    // 不改写——调用方（管理端 handler）把这段文案原样转成 400。
+    //
+    // 包一层 InvalidRosterError 只加类型不加文案：校验失败与「KV 写失败」在
+    // 上层必须能分开——前者答 400 并把文案给管理员，后者答 500 且不该把平台
+    // 的原始错误文本外露。不包装的话两者都是裸 Error，调用点只能靠「是不是
+    // 在校验之后抛出」去猜，而那个判断随实现顺序变动。
+    let students: RosterStudent[];
+    try {
+      students = parseSingleDocument(payload, name);
+    } catch (error) {
+      throw new InvalidRosterError(error instanceof Error ? error.message : String(error));
+    }
 
     // 先写原文。若随后 index 更新失败，数据仍在 KV 里（下次修好 index 就能加载），
     // 反过来先写 index 再写原文失败，则 index 会指向一个读不到的空项。
@@ -289,6 +322,27 @@ function normalizeSchoolName(school: string): string {
     if (rune < " " || rune === "\u007f") {
       throw new InvalidSchoolNameError("校名不能含控制字符");
     }
+  }
+  // 键长上限前置。真实的 KV 对键名有 512 字节的硬限制（官方 Limits 页注明
+  // 键名上限 512 bytes，Free 与 Paid 一致），超过它的写与删都会在平台侧抛错。
+  //
+  // 判定用 rosterKey(name) 的字节数而不是校名的字节数：前缀 "roster:" 也占
+  // 同一份额度，只算校名会让「校名 512 字节」这种边界悄悄越过限制。用 UTF-8
+  // 编码算字节，与平台口径一致（汉字是三字节，不能用码元或码点数近似）。
+  //
+  // 为什么必须在存储层前置，而不是让平台去拒绝：
+  // 1. 平台拒绝抛的是它自己的错误文本，管理端只能原样转发——「存储层写失败」
+  //    会被标注成「你上传的名单内容不合法」，管理员拿着好文件反复重传，
+  //    排障方向被引偏；而且内部错误文本会外露给客户端。
+  // 2. PUT 与 DELETE 若各自面对平台抛错，处置还会分叉（一个乐观成功、一个 500）。
+  //    前置成同一个 InvalidSchoolNameError 之后，两条方法得到同一件事：
+  //    「这个校名不能用」，400，理由同一句。
+  //
+  // ponytail: 这是对「未知校名」的提前拒绝，不是完整性校验——它只判定键名额度，
+  // 不判定 KV 的其他限制（值大小 25 MiB 等）。值大小超限仍由平台抛错并走
+  // data_unavailable；真要在本地复刻全部限制，维护成本高于收益。
+  if (new TextEncoder().encode(rosterKey(name)).length > ROSTER_KEY_MAX_BYTES) {
+    throw new InvalidSchoolNameError("校名过长（键名超过 512 字节）");
   }
   return name;
 }
