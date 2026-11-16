@@ -7,7 +7,7 @@ export default defineConfig({
     outDir: "server/web",
     emptyOutDir: true,
     // Vite 8 的 Rolldown 分包：以正则 test 匹配模块路径，同名 group 合并进同一 chunk。
-    // 与旧 manualChunks 函数等价：react 与 scheduler 同入 vendor-react，border-beam 单独成组；
+    // 与旧 manualChunks 等价：react 与 scheduler 同入 vendor-react，border-beam 单独成组；
     // liquid-gooey 与 thinking-orbs 不单独分组，按默认规则随引用方落位。
     rolldownOptions: {
       output: {
