@@ -5,11 +5,10 @@
 // TestSearchMethodNotAllowed（405 带 Allow: GET）、server/ratelimit_test.go
 // 的 429 带 Retry-After 补齐 headers 通道的用例。
 //
-// 与 Go 的差异只有一处且是签名决定的：Go 的 writeError 只收错误码、状态靠
-// errStatus 表带出；本层的 writeError 额外收 status，由发射点显式传入。
-// 因此「未知码」不再是「查不到表」而是「调用点给了什么状态就写什么状态」，
-// 等价性由 TestErrStatusMapping 的逐条表断言 + 发射点统一取
-// ERR_STATUS[ERR_CODES.x] 的纪律共同保证，细节见 errors.ts 顶部注释。
+// 签名与 Go 对齐：writeError 只收错误码（外加可选头），状态由函数内部查
+// ERR_STATUS 带出。因此「未知码回落 500」测的是函数行为，与 Go 的用例同义。
+// ApiException 的 status 由抛出点给定（抛出处已知自己是 400 还是 429），
+// toResponse 只负责把 status + code + headers 转成响应。
 import { describe, expect, it } from "vitest";
 import { ApiException, ERR_CODES, ERR_STATUS, writeError, writeJSON } from "./errors";
 
@@ -59,8 +58,9 @@ describe("writeError 错误响应", () => {
   // 对应 Go 端 TestWriteErrorWritesJSONBody：状态 400、体为单键 error 对象。
   // 只断言单键，是因为 Go 用 map[string]string{"error": code}——多一个字段
   // 就是 wire 契约变化，前端与手工排查都在读这个 body。
+  // 调用点只传码：状态由 writeError 自己查表带出，与 Go 的 writeError 同形。
   it("写出 status、Content-Type 与单键 error 体", async () => {
-    const res = writeError(ERR_STATUS[ERR_CODES.invalidLimit], ERR_CODES.invalidLimit);
+    const res = writeError(ERR_CODES.invalidLimit);
     expect(res.status).toBe(400);
     expect(res.headers.get("Content-Type")).toBe(jsonContentType);
     expect(await res.json()).toEqual({ error: "invalid_limit" });
@@ -68,7 +68,7 @@ describe("writeError 错误响应", () => {
 
   // 405 必须声明 Allow: GET（Go 端 api.go / schools.go 在写错误体前 Set）。
   it("405 可带 Allow 头", async () => {
-    const res = writeError(ERR_STATUS[ERR_CODES.methodNotAllowed], ERR_CODES.methodNotAllowed, { Allow: "GET" });
+    const res = writeError(ERR_CODES.methodNotAllowed, { Allow: "GET" });
     expect(res.status).toBe(405);
     expect(res.headers.get("Allow")).toBe("GET");
     expect(await res.json()).toEqual({ error: "method_not_allowed" });
@@ -76,25 +76,43 @@ describe("writeError 错误响应", () => {
 
   // 429 必须带整数秒 Retry-After（Go 端 ratelimit.go 的约定）。
   it("429 可带 Retry-After 头", async () => {
-    const res = writeError(ERR_STATUS[ERR_CODES.rateLimited], ERR_CODES.rateLimited, { "Retry-After": "1" });
+    const res = writeError(ERR_CODES.rateLimited, { "Retry-After": "1" });
     expect(res.status).toBe(429);
     expect(res.headers.get("Retry-After")).toBe("1");
     expect(await res.json()).toEqual({ error: "rate_limited" });
   });
 
-  // 未知码：Go 无 status 参数所以回落 500；本层状态由调用点给出，
-  // 写成与 Go 调用点相同的取法（ERR_STATUS[code] 查不到时给 500）即等价。
-  // 这条同时锁住「未知码不抛异常、code 原样透出」——错误路径不能再制造错误。
-  it("未知码按调用点给出的状态写出，code 原样保留", async () => {
-    const res = writeError(ERR_STATUS["unknown_code"] ?? 500, "unknown_code");
+  // 对应 Go 端 TestWriteErrorUnknownCodeFallsBackTo500：未登记的码回落 500。
+  // 这条锁的是函数行为，不是测试作者自己写的取法——若有人把 writeError 改回
+  // 「收 status」，这里必须重新失败，因为漏传状态在 Response 构造里会静默变 200。
+  // 同时锁住 code 原样透出：错误路径不能再制造错误（体不能变成 {}）。
+  it("未知码回落 500 且 code 原样保留", async () => {
+    const res = writeError("unknown_code");
     expect(res.status).toBe(500);
     expect(await res.json()).toEqual({ error: "unknown_code" });
+  });
+
+  // 未知 /api/* 的 404 端到端行为：从码到状态走完一次完整查表。
+  // 只断言 ERR_STATUS[notFound] === 404 是表断言，断言 writeError 的输出
+  // 才证明「码经由写出函数真的产出 404 加 JSON 体」。
+  it("not_found 经写出函数产出 404 与 JSON 错误体", async () => {
+    const res = writeError(ERR_CODES.notFound);
+    expect(res.status).toBe(404);
+    expect(res.headers.get("Content-Type")).toBe(jsonContentType);
+    expect(await res.json()).toEqual({ error: "not_found" });
+  });
+
+  // data_unavailable 经写出函数必须落 500：它与未知码回落值相同，
+  // 若实现误把「查表失败」当唯一 500 来源，这条能区分「确实是这个码」。
+  it("data_unavailable 经写出函数产出 500", async () => {
+    expect(writeError(ERR_CODES.dataUnavailable).status).toBe(500);
   });
 
   // 错误响应不得被中间层缓存：调用点可通过 headers 传 Cache-Control，
   // 这里只验通道可用，具体策略由 middleware 层统一负责。
   it("headers 参数按原样铺设到响应", () => {
-    const res = writeError(400, ERR_CODES.invalidQuery, { "Cache-Control": "no-store", "X-Trace": "abc" });
+    const res = writeError(ERR_CODES.invalidQuery, { "Cache-Control": "no-store", "X-Trace": "abc" });
+    expect(res.status).toBe(400);
     expect(res.headers.get("Cache-Control")).toBe("no-store");
     expect(res.headers.get("X-Trace")).toBe("abc");
   });
@@ -113,6 +131,26 @@ describe("writeJSON 响应写出", () => {
   it("调用点传入的 Content-Type 被强制覆盖为 JSON", () => {
     const res = writeJSON(200, {}, { "Content-Type": "text/plain" });
     expect(res.headers.get("Content-Type")).toBe(jsonContentType);
+  });
+
+  // HTTP 头名大小写不敏感，对象键却敏感：若实现用手抄键名的方式合并，
+  // 传 {"content-type":"text/plain"} 会与 "Content-Type" 各占一键，
+  // 产出 "text/plain, application/json; charset=utf-8" 这种非法拼接值。
+  // 这条断言最终值恰为单一 JSON 类型，锁住 Headers 的大小写折叠。
+  it("小写 content-type 键同样被折叠覆盖为单一 JSON 类型", () => {
+    const res = writeJSON(200, {}, { "content-type": "text/plain" });
+    expect(res.headers.get("Content-Type")).toBe(jsonContentType);
+    expect(res.headers.get("content-type")).toBe(jsonContentType);
+  });
+
+  // undefined 不带 JSON 表示：JSON.stringify(undefined) 返回 undefined，
+  // Response 会吞成 0 字节 body，调用 res.json() 直接抛解析错误。
+  // Go 的 Encode(nil) 产出 null，这里用 ?? null 对齐。
+  it("value 为 undefined 时写出 null 而非空 body", async () => {
+    const res = writeJSON(200, undefined);
+    expect(res.headers.get("Content-Type")).toBe(jsonContentType);
+    expect(await res.text()).toBe("null");
+    expect(await writeJSON(200, undefined).json()).toBeNull();
   });
 
   it("可写出任意 JSON 值：数组、字符串、null、数字", async () => {
@@ -154,15 +192,42 @@ describe("ApiException 异常承载", () => {
     expect(err).toBeInstanceOf(ApiException);
   });
 
+  // toResponse 是 index 层唯一的转译入口：状态、错误体、头都在这里落地，
+  // 装配层不手拼 JSON。体形态必须仍是单键 error，与 writeError 同源。
+  it("toResponse 按抛出点给定的 status 产出错误响应", async () => {
+    const err = new ApiException(400, ERR_CODES.invalidOffset);
+    const res = err.toResponse();
+    expect(res.status).toBe(400);
+    expect(res.headers.get("Content-Type")).toBe(jsonContentType);
+    expect(await res.json()).toEqual({ error: "invalid_offset" });
+  });
+
+  it("toResponse 保留抛出点给出的头（429 的 Retry-After）", async () => {
+    const res = new ApiException(429, ERR_CODES.rateLimited, { "Retry-After": "1" }).toResponse();
+    expect(res.status).toBe(429);
+    expect(res.headers.get("Retry-After")).toBe("1");
+    expect(await res.json()).toEqual({ error: "rate_limited" });
+  });
+
+  // 抛出点给的 status 优先：即便码在表里映射到别的状态（这里 data_unavailable
+  // 映 500），异常路径也不回查 ERR_STATUS，避免两处状态来源打架。
+  it("toResponse 不回落 ERR_STATUS 查表，status 以抛出点为准", () => {
+    expect(new ApiException(418, ERR_CODES.dataUnavailable).toResponse().status).toBe(418);
+  });
+
   // 抛出后能被 catch 拿到，且 instanceof 判定必须在对手写 Error 重生后仍成立：
   // 转译目标是 ES2022，不存在降级到 ES5 丢原型链的问题，这里锁住即可。
-  it("抛出与捕获保持类型", () => {
+  it("抛出与捕获保持类型，且可直接转响应", async () => {
     try {
       throw new ApiException(405, ERR_CODES.methodNotAllowed, { Allow: "GET" });
     } catch (caught) {
       expect(caught).toBeInstanceOf(ApiException);
       expect((caught as ApiException).status).toBe(405);
       expect((caught as ApiException).headers).toEqual({ Allow: "GET" });
+      const res = (caught as ApiException).toResponse();
+      expect(res.status).toBe(405);
+      expect(res.headers.get("Allow")).toBe("GET");
+      expect(await res.json()).toEqual({ error: "method_not_allowed" });
     }
   });
 });
