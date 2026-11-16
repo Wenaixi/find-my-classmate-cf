@@ -4,24 +4,35 @@
 // 本文件只管「一份 JSON 原文 → 学生快照」，或整份拒绝。
 //
 // 错误文案与 Go 逐字一致，这是本文件的硬约束：运维靠这句话判断该去看哪一份
-// 文件的哪一层。文案里带 来源名（文件名）/ 校名 / 年级名 / 班名，逐层收窄定位。
+// 文件的哪一层。文案里带 来源名 / 校名 / 年级名 / 班名，逐层收窄定位。
 // 改任何一个字都等于让既有排障手册失效，因此测试用逐字断言而非子串断言。
 //
-// 校验顺序与 Go 完全一致，顺序本身也是语义：先判整体结构（有没有学校数组），
-// 再按 学校 → 年级 → 班级 → 学生 的层级逐条向下。同一份文件有多处错误时，
-// 最先到达的那处决定文案——顺序变了，运维看到的错误就变了。
+// 校验分两阶段，与 Go 的 json.Unmarshal + loadStudents 同构：
 //
-// 依赖方向单向：grades.ts（年段值域）、classparse.ts（班级解析与空白剥除）、
-// student.ts（领域形状与构造入口）→ 本文件。本文件不持有第二份年段清单，
-// 也不重新实现班级解析或姓名归一化。
+//   阶段一 decodeDocument：类型检查。字段缺失或为 null 按 Go 的零值语义处理
+//   （字符串字段得空串、切片字段得空切片，不报错）；字段存在但类型不对（如
+//   年级写成字符串、学校写成对象）则整份报「解析 失败」，与 Go 的 cannot
+//   unmarshal 同族。
+//
+//   阶段二 语义校验：按 学校 → 年级 → 班级 → 学生 逐层判定空值与格式，
+//   顺序与 Go 完全一致，顺序本身也是语义——同一份文件有多处错误时，最先
+//   到达的那处决定文案。
+//
+// 两阶段不能合并成「边遍历边判类型」：Go 的 unmarshal 先把整份文档的类型错
+// 全查完才开始跑 loadStudents，因此一份文件若前面有空校名、后面有类型错误，
+// Go 报的是解析失败。就地判类型的实现会先撞上空校名、报出语义文案，与 Go 分叉。
+//
+// 依赖方向单向：classparse.ts（班级解析与空白剥除）、student.ts（领域形状与
+// 构造入口）→ 本文件。本文件不持有第二份年段清单，也不重新实现班级解析或
+// 姓名归一化；Grade 的收窄只发生在传给构造入口的那一处。
 import { parseClassName, trimGoSpace } from "./classparse";
 import type { Grade } from "./grades";
 import { newStudentSchool, type RosterStudent } from "./student";
 
 // 源 JSON 的文档形状，字段名保持中文键：这是上游 build_hierarchy_json.py
 // 输出的真实形状，与领域形状 RosterStudent 是两个不同的类型——前者是磁盘/传输
-// 上的原文，后者是加载后的领域对象。所有字段都可能缺失或类型不符（JSON 是
-// 不可信输入），因此类型上不承诺「已存在」，由本文件的运行时守门逐层检查。
+// 上的原文，后者是加载后的领域对象。字段全部标为可选，因为 JSON 是不可信输入，
+// 「字段不在」与「字段类型不对」是两种必须区别对待的情形（见 decodeDocument）。
 export interface RosterDocument {
   区县?: string;
   学校?: Array<{
@@ -36,6 +47,31 @@ export interface RosterDocument {
   }>;
 }
 
+// 阶段一的产物：字段已全部落成确定类型，缺失按 Go 零值补齐。
+// 语义阶段因此不必再处理「这个字段到底是什么类型」，只判空值与格式。
+interface DecodedDocument {
+  schools: DecodedSchool[];
+}
+
+interface DecodedSchool {
+  name: string;
+  grades: DecodedGrade[];
+}
+
+interface DecodedGrade {
+  name: string;
+  classes: DecodedClass[];
+}
+
+interface DecodedClass {
+  name: string;
+  students: DecodedStudent[];
+}
+
+interface DecodedStudent {
+  name: string;
+}
+
 // RosterLoadState 跨文件承接的加载态：校名 → 已分配的 SchoolIdx 映射，
 // 以及下一个待分配的 SchoolIdx。两项都是 Go 端 loadStudents 里循环外的
 // 同一份状态，必须在多次调用之间延续：
@@ -47,23 +83,31 @@ export interface RosterDocument {
 //   「文件名的字典序 + 文件内首次出现序」。每次调用从 0 重新分配会让第二份
 //   文件里的学校排到第一份之前，下拉顺序与加载序错位。
 //
-// 用可变对象而非「返回值带上新状态」：调用方是目录遍历循环，它本来就持有
-// 这份状态并逐份递进；Go 端也是同一个循环里的两个局部变量。返回新状态会
-// 迫使调用方每次解构重赋，而漏更新一次就是静默的顺序错乱。
+// 契约：**本对象在一次解析失败后不可复用。** 校名占位与 nextSchool 自增发生在
+// 各层校验之前（与 Go 同序），因此中途失败会留下「已占位但未产出学生」的残留。
+// 拿同一个残留状态重试同一份修好的文件，会报出误导性的「校名重复」——Go 没有
+// 这个问题，因为它每次加载都从零建这两张表。调用方（目录遍历 / 管理端）在失败
+// 后必须换一份新状态重来（newRosterLoadState），而不是清空后继续用。
+//
+// 替补做法是「失败时回滚」：在 try 里记录进函数时的快照，catch 里恢复。
+// 不做，是因为回滚会掩盖调用顺序的错误——它的代价是让「失败后继续用旧状态」
+// 看起来正确，从而无人发现本来就是新旧混用；显式换新态则把契约留在类型与
+// 文档上。测试锁住了这条契约的两侧（旧态报重复、新态成功）。
 export interface RosterLoadState {
   schoolOrder: Map<string, number>;
   nextSchool: number;
 }
 
 // newRosterLoadState 构造一份空加载态：尚未分配任何学校下标。
-// 所有加载路径都必须经此入口取得初始状态，而不是手写 { schoolOrder: new Map(), nextSchool: 0 }。
+// 所有加载路径都必须经此入口取得初始状态，而不是手写
+// { schoolOrder: new Map(), nextSchool: 0 }。
 export function newRosterLoadState(): RosterLoadState {
   return { schoolOrder: new Map(), nextSchool: 0 };
 }
 
-// 去重键的分隔符。用 NUL（"\x00"）而不是任何可见字符：校名/年级名/姓名都是
-// 自由文本，可见分隔符可能与某个真实字段值重合，导致「两段拼起来相同但分段
-// 不同」的两条记录被误判为同一人。NUL 不会出现在这些字段里（Go 端同一取舍）。
+// 去重键的分隔符。用 NUL（"\u0000"）而不是任何可见字符：校名/年级名/姓名
+// 都是自由文本，可见分隔符可能与某个真实字段值重合，导致「两段拼起来相同但
+// 分段不同」的两条记录被误判为同一人。NUL 不会出现在这些字段里（Go 端同一取舍）。
 const KEY_SEPARATOR = "\u0000";
 
 // errNoRosterMessage 是「一份名单都没有」的运维指引，与 Go 端 errNoRoster 逐字一致。
@@ -73,16 +117,16 @@ export function errNoRosterMessage(): string {
   return "数据文件缺失，请将 roster JSON（区县/学校/年级/班级/学生 结构）放入数据目录";
 }
 
-// parseRosterDocument 解析一份 roster JSON 原文并校验其结构，返回通过守门的学生快照。
-// payload 是文件原文（可能带 BOM，可能不是 UTF-8 意义上的合法 JSON）；
-// sourceName 是错误文案里的来源标识（Go 端传文件名，管理端可传校名/上传标识）。
-// state 是跨文件承接的加载态；缺省时用一份新状态，供单文件校验（如管理端
-// 上传单个校区的名单）使用。
+// parseRosterDocument 解析一份 roster JSON 原文并校验其结构，把学生追加进
+// 通过守门的快照。payload 是文件原文（可能带 BOM）；sourceName 是错误文案里的
+// 来源标识（Go 端传文件名，管理端可传校名/上传标识）；state 是跨文件承接的
+// 加载态，**必填**：多文件调用点漏传会让「校名唯一 + SchoolIdx 单调」静默失效，
+// 必填使漏传变成编译错误。单文件校验（管理端上传一份名单）用 parseSingleDocument。
 //
 // 失败一律抛错且整份拒绝，绝不部分接受：一份名单里有坏记录时，若只跳过坏记录，
 // 服务会带着「看起来正常」的不完整数据对外服务，而运维无从知道少了谁。
 // Go 端 fail-closed 的取舍由本函数的抛错承接，调用方转成 503 / 400。
-export function parseRosterDocument(payload: string, sourceName: string, state: RosterLoadState = newRosterLoadState()): RosterStudent[] {
+export function parseRosterDocument(payload: string, sourceName: string, state: RosterLoadState): RosterStudent[] {
   // BOM 剥离与 Go 的 bytes.TrimPrefix(payload, {0xEF,0xBB,0xBF}) 同义：
   // 只剥开头的一个，不剥中间的，也不剥第二个。Windows 编辑器保存的 UTF-8
   // 文件常带 BOM，JSON.parse 会把它当成非法字符直接报错——剥掉它，让「用
@@ -91,40 +135,26 @@ export function parseRosterDocument(payload: string, sourceName: string, state: 
     payload = payload.slice(1);
   }
 
-  let document: RosterDocument;
-  try {
-    document = JSON.parse(payload) as RosterDocument;
-  } catch (error) {
-    // 与 Go 的 fmt.Errorf("解析 %s 失败: %w", name, err) 同形：前缀逐字一致，
-    // 底层解析器细节随后。JSON.parse 抛的是 SyntaxError，取 message 而不是
-    // 直接拼对象——否则文案里会出现 "SyntaxError: " 前缀，与 Go 的文本分叉。
-    const detail = error instanceof Error ? error.message : String(error);
-    throw new Error(`解析 ${sourceName} 失败: ${detail}`);
-  }
+  const document = decodeDocument(payload, sourceName);
 
   // 结构守门：合法 JSON 但不是 roster 形状（连 学校 键都没有，或数组为空）。
   // 空对象能过 JSON.parse 而必须死在这里：它解出了一个「没有任何学校」的文档，
   // 若放行会得到一份空名单，服务正常启动并对外返回「没有学生」——把「放错文件」
   // 伪装成「这所学校没有学生」，运维查不出根因。
-  //
-  // 判定用 Array.isArray 而非只判长度：JSON 里 学校 也可能是字符串或对象，
-  // 那些形状没有 length（或 length 语义完全不同），直接取长度会得到 undefined
-  // 或荒谬的值，让守门的判据本身失效。
-  const schools = Array.isArray(document?.学校) ? document.学校 : [];
-  if (schools.length === 0) {
+  if (document.schools.length === 0) {
     throw new Error(`${sourceName} 缺少学校数据（不是 roster 格式）`);
   }
 
   const students: RosterStudent[] = [];
   // seen 的去重键含学校：跨校同名同班不再互吞。键里的学校段是 trimmed 校名，
-    // 与 schoolOrder 的键同源，保证「同一所学校」在两处判定上一致。
+  // 与 schoolOrder 的键同源，保证「同一所学校」在两处判定上一致。
   const seen = new Set<string>();
 
-  for (const school of schools) {
+  for (const school of document.schools) {
     // 空白处理逐项走 trimGoSpace（Go 的 strings.TrimSpace 语义）：纯空白的校名
     // 与空串同判为缺失。不能用 String.prototype.trim —— 它会剥掉 U+FEFF，
-    // 而 Go 不剥，两端对「这算不算有校名」因此分叉。
-    const schoolName = trimGoSpace(textOf(school?.校名));
+    // 而 Go 不剥，两端对「这算不算有校名」因此分叉（测试锁住了这个分离点）。
+    const schoolName = trimGoSpace(school.name);
     if (schoolName === "") {
       throw new Error(`${sourceName} 存在缺少校名的学校记录`);
     }
@@ -136,16 +166,15 @@ export function parseRosterDocument(payload: string, sourceName: string, state: 
     }
     // SchoolIdx 单调递增：先占位再自增，与 Go 的 schoolIdx := nextSchool;
     // schoolOrder[schoolName] = schoolIdx; nextSchool++ 同序。注意分配发生在
-    // 年级/班级/学生的校验之前——后续层级报错时这份文件整份被拒，但本次调用
-    // 已经分配的 SchoolIdx 会留在加载态里。这与 Go 端行为一致：Go 的
-    // loadStudents 出错时整个目录加载失败，内存快照不被发布，下一次重载
-    // 重新从空状态开始分配，因此残留的占位不会进入任何对外快照。
+    // 年级/班级/学生的校验之前——后续层级报错时这份文件整份被拒，而本次调用
+    // 已分配的 SchoolIdx 会留在加载态里（见 RosterLoadState 的「失败后不可复用」
+    // 契约；Go 因整目录重载从零建态，不暴露这一点）。
     const schoolIdx = state.nextSchool;
     state.schoolOrder.set(schoolName, schoolIdx);
     state.nextSchool++;
 
-    for (const grade of arrayOf(school?.年级)) {
-      const gradeName = trimGoSpace(textOf(grade?.年级名));
+    for (const grade of school.grades) {
+      const gradeName = trimGoSpace(grade.name);
       if (gradeName === "") {
         throw new Error(`${sourceName} / ${schoolName} 存在缺少年级名的年级记录`);
       }
@@ -157,8 +186,8 @@ export function parseRosterDocument(payload: string, sourceName: string, state: 
       // 边界依赖的正是这个越界值。
       const gradeValue = gradeName as Grade;
 
-      for (const classItem of arrayOf(grade?.班级)) {
-        const className = trimGoSpace(textOf(classItem?.班名));
+      for (const classItem of grade.classes) {
+        const className = trimGoSpace(classItem.name);
         if (className === "") {
           throw new Error(`${sourceName} / ${schoolName} / ${gradeName} 存在缺少班名的班级记录`);
         }
@@ -171,11 +200,11 @@ export function parseRosterDocument(payload: string, sourceName: string, state: 
           throw new Error(`${sourceName} / ${schoolName} / ${gradeName} 班级格式异常（${className}）`);
         }
 
-        for (const item of arrayOf(classItem?.学生)) {
+        for (const item of classItem.students) {
           // 姓名不 trim：Go 端直接比较 item.Name == ""，空串才拒绝，纯空白姓名
           // 是允许的（真实名单里出现过带前导空格的姓名，Go 端接受并原样保留）。
           // 归一化留给 newStudentSchool 的 nameKey，本文件不改写原始姓名。
-          const studentName = textOf(item?.姓名);
+          const studentName = item.name;
           if (studentName === "") {
             throw new Error(`${sourceName} / ${schoolName} / ${className} 学生记录格式异常`);
           }
@@ -206,21 +235,125 @@ export function parseRosterDocument(payload: string, sourceName: string, state: 
   return students;
 }
 
-// textOf 把 JSON 里不保证是字符串的字段安全转成字符串。
-// 只接受字符串原样返回，其余（数字、布尔、null、对象、数组）一律转成空串：
-// 空串会落到上层「缺失」判定并报出对应的层级文案，而不是抛一条 TypeError。
+// parseSingleDocument 是单文件校验的显式入口：管理端上传一份名单、或对一份
+// 候选文件做形态校验时用。内部新建一次性加载态，因此不会有跨文件状态，
+// 也不会受「失败后 state 不可复用」契约影响。
 //
-// 这条取舍的理由是错误定位：真实名单是脚本生成的，字段类型写错（如姓名写成
-// 数字）时，运维需要看到「学生记录格式异常」并知道是哪份文件哪个班，而不是
-// 一条与数据无关的 JS 运行时异常。非字符串字段在这里一律按缺失处理。
-function textOf(value: unknown): string {
-  return typeof value === "string" ? value : "";
+// 单独存在的理由是让两种调用意图在类型上分开：多文件加载必须传 state（漏传
+// 是编译错误），单文件校验则不该被要求造一个只活一行的状态对象。
+export function parseSingleDocument(payload: string, sourceName: string): RosterStudent[] {
+  return parseRosterDocument(payload, sourceName, newRosterLoadState());
 }
 
-// arrayOf 把 JSON 里不保证是数组的字段安全转成数组：不是数组就当空数组。
-// 缺 年级 的学校、缺 班级 的年级都在形状上「没有下级」，与空数组同义，
-// 都产出零名学生而不是报错——Go 端的 json.Unmarshal 对缺失数组字段同样得到
-// 长度为 0 的切片，本函数与它逐条对齐。
-function arrayOf<T>(value: T[] | undefined): T[] {
-  return Array.isArray(value) ? value : [];
+// decodeDocument 是阶段一：把不可信 JSON 落成确定类型，缺字段按 Go 零值补齐，
+// 类型不对则整份报「解析 失败」。错误族与 JSON.parse 失败同一前缀
+//（`解析 ${sourceName} 失败: `），细节沿用 Go 的 cannot unmarshal 措辞，
+// 使运维在两种失败（语法坏、类型坏）之间可以用同一个 grep 找到，
+// 又能从细节区分该改语法还是该改字段类型。
+//
+// 顶层不是对象时同样报错（Go 的 cannot unmarshal array/number into Go value
+// of type sourceDocument）；顶层为 null 按 Go 语义当零值文档处理，落到
+// 「缺少学校数据」。数组元素不是对象（如 学校:[123]）与字段类型错误同判。
+function decodeDocument(payload: string, sourceName: string): DecodedDocument {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(payload);
+  } catch (error) {
+    // 取 message 而不是直接拼对象：否则文案里会出现 "SyntaxError: " 前缀，
+    // 与 Go 的文本分叉。
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`解析 ${sourceName} 失败: ${detail}`);
+  }
+
+  // 顶层 null 按 Go 的零值文档：不报错，交给「缺少学校数据」判定。
+  const document = readRecord(raw === null ? {} : raw, sourceName, "RosterDocument");
+
+  const schools: DecodedSchool[] = [];
+  // 每层都显式算一条 JSON 路径（schoolPath / gradePath / classPath），
+  // 类型错误的文案里带它，运维因此能直接定位到「第几个学校第几个年级第几个班」，
+  // 而不必猜 Go 的 struct field 名。路径只用于错误文案，不参与任何判定。
+  for (const [index, rawSchool] of readArray(document.学校, sourceName, "RosterDocument.学校").entries()) {
+    const schoolPath = `RosterDocument.学校[${index}]`;
+    const school = readRecord(rawSchool, sourceName, schoolPath);
+    const grades: DecodedGrade[] = [];
+    for (const [gradeIndex, rawGrade] of readArray(school.年级, sourceName, `${schoolPath}.年级`).entries()) {
+      const gradePath = `${schoolPath}.年级[${gradeIndex}]`;
+      const grade = readRecord(rawGrade, sourceName, gradePath);
+      const classes: DecodedClass[] = [];
+      const classPath = `${gradePath}.班级`;
+      for (const [classIndex, rawClass] of readArray(grade.班级, sourceName, classPath).entries()) {
+        const currentClassPath = `${classPath}[${classIndex}]`;
+        const classItem = readRecord(rawClass, sourceName, currentClassPath);
+        const students: DecodedStudent[] = [];
+        const studentPath = `${currentClassPath}.学生`;
+        for (const [studentIndex, rawStudent] of readArray(classItem.学生, sourceName, studentPath).entries()) {
+          const currentStudentPath = `${studentPath}[${studentIndex}]`;
+          const student = readRecord(rawStudent, sourceName, currentStudentPath);
+          students.push({ name: readText(student.姓名, sourceName, `${currentStudentPath}.姓名`) });
+        }
+        classes.push({ name: readText(classItem.班名, sourceName, `${currentClassPath}.班名`), students });
+      }
+      grades.push({ name: readText(grade.年级名, sourceName, `${gradePath}.年级名`), classes });
+    }
+    schools.push({ name: readText(school.校名, sourceName, `${schoolPath}.校名`), grades });
+  }
+  return { schools };
+}
+
+// readText 读取字符串字段的三态语义：缺失或 null 得空串（Go 零值，不报错）；
+// 是字符串则原样返回；其余类型（数字、布尔、对象、数组）整份报解析失败。
+//
+// 与旧实现的关键差别：旧版把「类型不对」也换成空串，于是 {"年级":"高一"}
+// 这类输入被静默当成「没有年级」，产出空名单、服务正常启动对外报「没有学生」
+// ——正是「放错文件伪装成这所学校没有学生」的同一种病。Go 端对同一输入是
+// 解析失败，运维能立刻看出文件结构坏了。
+function readText(value: unknown, sourceName: string, path: string): string {
+  if (value === undefined || value === null) return "";
+  if (typeof value === "string") return value;
+  return throwTypeMismatch(value, sourceName, path, "string");
+}
+
+// readArray 读取数组字段的三态语义：缺失或 null 得空数组（Go 的 nil 切片，
+// 不报错）；是数组则原样返回；其余类型整份报解析失败。
+function readArray(value: unknown, sourceName: string, path: string): unknown[] {
+  if (value === undefined || value === null) return [];
+  if (Array.isArray(value)) return value;
+  return throwTypeMismatch(value, sourceName, path, "array");
+}
+
+// readRecord 读取对象元素的三态语义：缺失或 null 得空对象（Go 的零值结构体，
+// 于是 学校:[null] 会落到「缺少校名」，与 Go 一致）；是对象则原样返回；
+// 其余类型（数字、字符串、数组）整份报解析失败。
+function readRecord(value: unknown, sourceName: string, path: string): Record<string, unknown> {
+  if (value === undefined || value === null) return {};
+  if (typeof value === "object" && !Array.isArray(value)) return value as Record<string, unknown>;
+  return throwTypeMismatch(value, sourceName, path, "object");
+}
+
+// throwTypeMismatch 构造并抛出类型不匹配错误，返回 never 使调用点可以直接
+// 当「此路不通」的分支返回。措辞沿用 Go 的 cannot unmarshal 形态，并补上
+// 字段路径（Go 的 struct field 名对运维不够直观，JSON 路径才指向具体位置）。
+function throwTypeMismatch(value: unknown, sourceName: string, path: string, expected: string): never {
+  throw new Error(
+    `解析 ${sourceName} 失败: json: cannot unmarshal ${jsonKindOf(value)} into Go value of type ${expected}（字段 ${path}）`,
+  );
+}
+
+// jsonKindOf 把运行时值映射为 Go cannot unmarshal 文案里的类型名。
+// 只覆盖 JSON 能产出的六种形态：object / array / string / number / bool / null。
+function jsonKindOf(value: unknown): string {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "array";
+  switch (typeof value) {
+    case "object":
+      return "object";
+    case "string":
+      return "string";
+    case "number":
+      return "number";
+    case "boolean":
+      return "bool";
+    default:
+      return "unknown";
+  }
 }
