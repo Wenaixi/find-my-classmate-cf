@@ -29,24 +29,18 @@ import { parseClassName, trimGoSpace } from "./classparse";
 import type { Grade } from "./grades";
 import { newStudentSchool, type RosterStudent } from "./student";
 
-// 源 JSON 的文档形状，字段名保持中文键：这是上游 build_hierarchy_json.py
-// 输出的真实形状，与领域形状 RosterStudent 是两个不同的类型——前者是磁盘/传输
-// 上的原文，后者是加载后的领域对象。字段全部标为可选，因为 JSON 是不可信输入，
-// 「字段不在」与「字段类型不对」是两种必须区别对待的情形（见 decodeDocument）。
-export interface RosterDocument {
-  区县?: string;
-  学校?: Array<{
-    校名?: string;
-    年级?: Array<{
-      年级名?: string;
-      班级?: Array<{
-        班名?: string;
-        学生?: Array<{ 姓名?: string }>;
-      }>;
-    }>;
-  }>;
-}
-
+// 源 roster JSON 的形状（上游 build_hierarchy_json.py 的输出）：
+//   区县: string
+//   学校: [{ 校名: string, 年级: [{ 年级名: string,
+//     班级: [{ 班名: string, 学生: [{ 姓名: string }] }] }] }]
+//
+// 刻意不声明为 TypeScript 接口：本文件从不把 JSON.parse 的结果断言成这个形状，
+// 阶段一只按 JSON 路径逐层取值（见 decodeDocument），因此一个「看起来是校验契约」
+// 的类型声明在这里是纯负担——它会与真实读取集静默分叉（例如 区县 被声明为 string，
+// 而 decodeDocument 根本不读它：该字段在生产逻辑里零消费，Go 的 loadStudents 同样
+// 不校验其语义）。形状信息留在注释里，读取动作留在 decodeDocument 里，两者不会彼此
+// 冒充。若后续要按 区县 展示，再连同校验与文案一起加——那属于新需求，不是本次平移。
+//
 // 阶段一的产物：字段已全部落成确定类型，缺失按 Go 零值补齐。
 // 语义阶段因此不必再处理「这个字段到底是什么类型」，只判空值与格式。
 interface DecodedDocument {
