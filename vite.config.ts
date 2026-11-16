@@ -13,9 +13,9 @@ export default defineConfig({
       output: {
         codeSplitting: {
           groups: [
-            { test: /node_modules\/react/, name: "vendor-react" },
-            { test: /node_modules\/scheduler/, name: "vendor-react" },
-            { test: /node_modules\/border-beam/, name: "vendor-beam" }
+            { test: /node_modules[\\/]react/, name: "vendor-react" },
+            { test: /node_modules[\\/]scheduler/, name: "vendor-react" },
+            { test: /node_modules[\\/]border-beam/, name: "vendor-beam" }
           ]
         }
       }
