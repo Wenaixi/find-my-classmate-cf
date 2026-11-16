@@ -202,6 +202,45 @@ describe("最终一致窗口", () => {
     expect(got.students[0].schoolIdx).toBe(0);
   });
 
+  // 失败-重试路径：loadAll 是全或无，抛错时本地加载态随栈帧一起销毁，
+  // 因此同一个 store 实例在喂进修好的文档后必须干净地从 SchoolIdx 0 重新开始。
+  //
+  // 这条用例锁的是「失败即放弃整次加载」这个契约本身，而不是某段实现细节：
+  // 若将来有人为了「部分学校仍可服务」改成 try/catch 逐校容错，坏文档占掉的
+  // 校名与 SchoolIdx 会残留，第二次加载就会报出误导性的「校名重复」，
+  // 或者在能用不报错的情况下把下标错位。没有这条断言，那种改动是静默通过的。
+  it("先遇坏文档抛错，换修好的文档后第二次加载成功且 SchoolIdx 从 0 开始", async () => {
+    const kv = new FakeRosterKV();
+    kv.seed(rosterIndexKey, JSON.stringify(["福清一中", "福清二中"]));
+    // 第一份文档坏在末层（班名 0 班非法）：此时校名与 SchoolIdx 已在本轮
+    // 加载态里占位，正是 roster.ts 契约说的「已占位但未产出学生」的残留态。
+    kv.seed(
+      rosterKey("福清一中"),
+      JSON.stringify({
+        学校: [
+          {
+            校名: "福清一中",
+            年级: [{ 年级名: "高一", 班级: [{ 班名: "0班", 学生: [{ 姓名: "张三" }] }] }],
+          },
+        ],
+      }),
+    );
+    kv.seed(rosterKey("福清二中"), rosterJson("福清二中", "高二", { "3班": ["王五"] }));
+
+    const store = new RosterStore(kv);
+    await expect(store.loadAll()).rejects.toThrow(/班级格式异常/);
+
+    // 换上修好的文档后重试同一个 store 实例。
+    kv.seed(rosterKey("福清一中"), rosterJson("福清一中", "高一", { "1班": ["张三"] }));
+    const got = await store.loadAll();
+
+    expect(got.schools).toEqual(["福清一中", "福清二中"]);
+    expect(got.students.map((s) => s.name)).toEqual(["张三", "王五"]);
+    // 关键断言：不是「能加载」而已，而是下标从头开始、没有接着残留态自增。
+    // 若复用了失败那轮的态，两校下标会是 [1, 2] 而不是 [0, 1]。
+    expect(got.students.map((s) => s.schoolIdx)).toEqual([0, 1]);
+  });
+
   // 校名唯一性由跨文件共享的加载态把控，与 Go 端 schoolOrder 同语义。
   // 两份 roster 文档里出现同一校名时必须整份拒绝，否则下拉出现重复项、
   // 同一校名在搜索侧指向两个 SchoolIdx。

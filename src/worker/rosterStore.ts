@@ -70,6 +70,12 @@ export function rosterKey(school: string): string {
 
 // READ_OPTIONS 抽出共用，避免四个读取点各写一份字面量后悄悄分叉
 // （例如某处漏了 cacheTtl，读数就不再走边缘缓存，计费与延迟都变）。
+//
+// cacheTtl 取 60 是与计划书一致的策略值，不是平台下限：官方文档写明
+// cacheTtl 最小值是 30，默认值也是 60。取默认值的理由有两条——名单是
+// 写少读多的数据，60 秒的读缓存能显著减少同一 colo 的回源与计费；
+// 代价是「刚写入的名单在别的 colo 上最多晚 60 秒可见」，而这个代价直接
+// 放大了下面 putRoster / deleteRoster 的读-改-写竞态窗口，见其标注。
 const READ_OPTIONS: RosterKVGetOptions = { type: "text", cacheTtl: 60 };
 
 // RosterStore 是名单的读取与写入入口。一个实例对应一组 KV 绑定，
@@ -85,9 +91,18 @@ export class RosterStore {
   // loadAll 读 index、批量读全部 roster 原文、按 index 顺序逐校校验，
   // 返回学生快照与本次真正加载到的学校名。
   //
-  // schools 返回的是「已加载」而不是「index 里声明」的集合：跳过 null 的
-  // 那些学校不在里面。调用方（学校下拉、健康检查）依据的是能服务什么，
-  // 而不是 KV 里写了什么。
+  // 返回的 schools 是「已加载」而不是「index 里声明」的集合：跳过 null 的
+  // 那些学校不在里面。这个选择让调用方依据「能服务什么」而不是「KV 里写了
+  // 什么」来决策，但它同时意味着**两个集合不等价**，调用方不得互换使用：
+  //
+  //   schools        只在本次读到了原文的学校，已过滤掉最终一致窗口里缺数据的项；
+  //   listSchools()  读 index，是声明集合，未做任何过滤。
+  //
+  // 差集（listSchools() 去掉 schools）就是本次被跳过的学校——这是把「静默
+  // 少一所」变成可观测信号的唯一入口。健康检查应当据此判断降级：差集非空即
+  // 「有学校此刻读不到数据」；差集全量（即 schools 为空）本函数已经抛
+  // errNoRosterMessage，不会走到这里。不要把两者当成同一个东西，也不要让
+  // 下拉与健康检查共用一处取值而不加区分。
   async loadAll(): Promise<{ students: RosterStudent[]; schools: string[] }> {
     const schools = await this.readIndex();
     if (schools.length === 0) {
@@ -97,6 +112,10 @@ export class RosterStore {
 
     // 一次批量读覆盖全部学校。逐 key 读在百校规模就会撞 Workers 的单次请求
     // subrequest 限额（每次 get 都算一次），批量读只算一次。
+    //
+    // ponytail: KV 的批量 get 单次最多 100 个 key（官方文档 Input: Max: 100 keys），
+    // 越界时平台行为未明说（报错或静默截断都可能）。当前学校数量级远未触线，
+    // 因此不分片。学校数向 100 逼近时，改成按 100 分组读并把各组 Map 合并。
     const documents = await this.kv.get(
       schools.map((school) => rosterKey(school)),
       READ_OPTIONS,
@@ -163,10 +182,20 @@ export class RosterStore {
     const schools = await this.readIndex();
     if (!schools.includes(name)) {
       // 只在真的新增时才写 index：覆盖同名学校不产生一次无意义的写扩散。
-      // ponytail: 读-改-写没有跨请求互斥，两个并发上传不同学校时可能各写一份
-      // index 而丢掉对方的新增项（后者覆盖先者）。校名仍是唯一键、roster 原文
-      // 也都在，丢的只是 index 里的一行，重传一次即可补回。真要强一致得把写入
-      // 收进一个 Durable Object 串行化——当前管理端是单管理员低频写入，不做。
+      //
+      // ponytail: 读-改-写没有跨请求互斥，两个并发写者会各写一份 index，
+      // 后者覆盖先者、丢掉对方的新增项。校名仍是唯一键、roster 原文也都写成了，
+      // 丢的只是 index 里的一行，重传一次即可补回。
+      //
+      // 这个窗口不是「两个请求几乎同时」那么窄：readIndex 走 READ_OPTIONS 的
+      // cacheTtl，跨 colo 的写入要等缓存过期才可见（官方文档明写「来自其他
+      // 全球网络位置的写入在缓存值过期前不可见」），因此在缓存周期内到达的
+      // 第二个写者，读到的很可能就是旧快照——窗口实际长达一个缓存周期
+      // （当前 60 秒）。调小 cacheTtl 能缩窗，但读侧会立刻增加回源、计费与延迟；
+      // 两者是同一根旋钮的两端。
+      //
+      // 真要强一致得把写入收进一个 Durable Object 串行化——当前管理端是
+      // 单管理员低频写入，不做。
       await this.kv.put(rosterIndexKey, JSON.stringify([...schools, name]));
     }
 
@@ -178,6 +207,10 @@ export class RosterStore {
   // roster 原文总会删掉，即使 index 里没有该校：KV 里可能留着孤儿 key
   // （例如 index 被手工改过），留着它会让同名重新上传的旧数据先于新数据可用。
   // 但 index 没有变化时不写 index，避免一次无意义的写扩散。
+  //
+  // 同 putRoster，本路径也走 index 的读-改-写，因此共享同一竞态与同一个
+  // 被 cacheTtl 放大的窗口：缓存周期内到达的第二个写者读到的是旧快照，
+  // 它写回的 index 会覆盖先者的改动。详见 putRoster 处的 ponytail 标注。
   async deleteRoster(school: string): Promise<boolean> {
     const name = normalizeSchoolName(school);
     const schools = await this.readIndex();
