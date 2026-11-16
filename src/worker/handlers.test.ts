@@ -6,6 +6,10 @@
 // TestSearchAcceptsBoundaryParameters，并补上 schools 端点与健康检查差集降级
 // （Ruling 13 要求的前端可观测降级信号）。
 //
+// 上面列出的每个 Go 用例名都必须在本文件里有一条对应断言，否则这条清单就是
+// 虚假覆盖声明——评审轮 1 正是凭这份清单发现 health 的 405 契约无人承接。
+// 改动本文件时请顺手核对清单与实际用例：新增名字要有用例，删用例要删名字。
+//
 // store 用真实的 RosterStore 加内存 fake KV 注入，而不是伪造一个 store 对象：
 // 「store 抛错 -> 500」这类用例的真实来源是 KV 里 index 缺失或文档损坏，
 // 用真实 store 才能让这条路径走完整实现，也不必对 RosterStore 的私有字段做类型断言。
@@ -366,9 +370,31 @@ describe("schoolsHandler", () => {
 });
 
 describe("healthHandler", () => {
+  // 对应 Go 端 TestHealthMethodNotAllowed（server/main_test.go:62-78）：
+  // 探针接口也必须是只读端点，非 GET 一律 405 并声明 Allow: GET，
+  // 否则 /api/health 会成为全站唯一接受写方法的只读端点。
+  //
+  // 数据用满 KV 而不是空 KV：满数据下若方法判定被放到数据加载之后，
+  // 状态码仍是 405（掩盖顺序错误），只有零 KV 读的断言会翻红——这条用例
+  // 因此专门承重「判定先于读」这一顺序约束，而不是顺带验个状态码。
+  it("非 GET 返回 405、Allow: GET 与 method_not_allowed 体，且不读 KV", async () => {
+    const kv = fullKV();
+    const res = await healthHandler(getRequest("/api/health", "POST"), {
+      store: new RosterStore(kv),
+      version: "v-test",
+    });
+
+    expect(res.status).toBe(405);
+    expect(res.headers.get("Allow")).toBe("GET");
+    expect(res.headers.get("Content-Type")).toBe(jsonContentType);
+    expect(await res.json()).toEqual({ error: "method_not_allowed" });
+    expect(kv.singleReads).toEqual([]);
+    expect(kv.batchReads).toEqual([]);
+  });
+
   // 数据完整：200 且体只有 status/version 两个键。
   it("数据完整返回 200 {status:ok, version}", async () => {
-    const res = await healthHandler({ store: new RosterStore(fullKV()), version: "v-test" });
+    const res = await healthHandler(getRequest("/api/health"), { store: new RosterStore(fullKV()), version: "v-test" });
 
     expect(res.status).toBe(200);
     expect(res.headers.get("Content-Type")).toBe(jsonContentType);
@@ -379,7 +405,7 @@ describe("healthHandler", () => {
 
   // loadAll 失败：503 degraded，reason 为 data，且 503 也带 version。
   it("loadAll 抛错返回 503 degraded reason=data 且带 version", async () => {
-    const res = await healthHandler({ store: new RosterStore(new FakeRosterKV()), version: "v-test" });
+    const res = await healthHandler(getRequest("/api/health"), { store: new RosterStore(new FakeRosterKV()), version: "v-test" });
 
     expect(res.status).toBe(503);
     const body = await res.json();
@@ -395,7 +421,7 @@ describe("healthHandler", () => {
     kv.seed(rosterKey("福清一中"), rosterJson("福清一中", "高一", { "1班": ["张伟"] }));
     // 福清二中的 roster 尚未扩散到本 colo：批量读返回 null，被跳过。
 
-    const res = await healthHandler({ store: new RosterStore(kv), version: "v-test" });
+    const res = await healthHandler(getRequest("/api/health"), { store: new RosterStore(kv), version: "v-test" });
 
     expect(res.status).toBe(503);
     const body = await res.json();
@@ -407,7 +433,7 @@ describe("healthHandler", () => {
     const kv = new FakeRosterKV();
     kv.seed(rosterIndexKey, JSON.stringify(["福清一中", "福清二中"]));
 
-    const res = await healthHandler({ store: new RosterStore(kv), version: "v-test" });
+    const res = await healthHandler(getRequest("/api/health"), { store: new RosterStore(kv), version: "v-test" });
 
     expect(res.status).toBe(503);
     expect((await res.json()).reason).toBe("data");
@@ -418,7 +444,7 @@ describe("healthHandler", () => {
     const kv = fullKV();
     kv.indexBurst = [JSON.stringify(["福清一中", "福清二中"]), "不是 JSON"];
 
-    const res = await healthHandler({ store: new RosterStore(kv), version: "v-test" });
+    const res = await healthHandler(getRequest("/api/health"), { store: new RosterStore(kv), version: "v-test" });
 
     expect(res.status).toBe(503);
     const body = await res.json();
@@ -432,7 +458,7 @@ describe("healthHandler", () => {
     const kv = fullKV();
     kv.indexBurst = [JSON.stringify(["福清一中", "福清二中"]), null];
 
-    const res = await healthHandler({ store: new RosterStore(kv), version: "v-test" });
+    const res = await healthHandler(getRequest("/api/health"), { store: new RosterStore(kv), version: "v-test" });
 
     expect(res.status).toBe(503);
     const body = await res.json();

@@ -24,7 +24,7 @@ import { MAX_LIMIT, MAX_QUERY_LENGTH, PAGE_SIZE } from "../shared/contract";
 import type { Grade } from "../shared/grades";
 import type { RosterStudent } from "../shared/student";
 import { ERR_CODES, writeError, writeJSON } from "./errors";
-import { RosterStore } from "./rosterStore";
+import type { RosterStore } from "./rosterStore";
 import { schoolList } from "./schools";
 import { SearchInSchool } from "./search";
 
@@ -191,6 +191,12 @@ export async function schoolsHandler(request: Request, ctx: HandlerContext): Pro
 
 // healthHandler 是探针：答「现在能不能对外声称数据完整」。
 //
+// 探测接口同样是只读端点，方法限定必须与 search / schools 同形：非 GET 一律
+// 405 并声明 Allow: GET（Go 端 api.go 把这条判定放在 handler 第一行）。
+// 顺序是硬约束——方法判定必须在任何 KV 读之前完成：写方法在探针路径上走到
+// 下游逻辑，会让「服务对一切方法都健康」这种误解成立，而每次探针的 KV 读
+// 现在已知要为健康检查付三次（见下），不该被一个注定 405 的请求白白消耗。
+//
 // 判据不是「有没有加载到任何一份名单」，而是「index 声明的每一所学校本次是否
 // 都读到了」。loadAll().schools 是本次实际加载成功的集合（已过滤掉读不到原文
 // 的项），listSchools() 读 index、是声明集合；两者的差集就是本次被跳过的学校。
@@ -211,8 +217,20 @@ export async function schoolsHandler(request: Request, ctx: HandlerContext): Pro
 // （那是管理端列表的自然空态），所以「声明集合为空」必须在这里单独判成失败：
 // loadAll 能加载到学生、而声明集合却为空，只可能是两次读取之间 index 消失了，
 // 此时若答 200 ok 就等于声称一份自己已经读不到索引的名单完整可用。
+//
+// 两次读取之间有窗口（TOCTOU）：loadAll 与 listSchools 各读一次 index，
+// KV 的最终一致意味着两次内容可能不一致——第二次多出一校会表现为差集非空，
+// 走 partial，这正是「有学校此刻读不到」的语义，可接受；第二次少一校则
+// 差集缩小甚至为空，探针会偏乐观地答 ok，但那一校在 loadAll 的批量读里
+// 也没读到、下一次探针就会看到。探针的价值在于「窗口内的降级可见」而非
+// 提供快照一致性，因此不为此加互斥或复用同一次 index 读。
+//
 // 注意 503 也带 version，否则降级响应无法指认部署。
-export async function healthHandler(ctx: HealthContext): Promise<Response> {
+export async function healthHandler(request: Request, ctx: HealthContext): Promise<Response> {
+  if (request.method !== "GET") {
+    return writeError(ERR_CODES.methodNotAllowed, { Allow: "GET" });
+  }
+
   try {
     const loaded = await ctx.store.loadAll();
     const declared = await ctx.store.listSchools();
