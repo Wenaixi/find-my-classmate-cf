@@ -1,4 +1,4 @@
-﻿// 横切关注点：安全响应头与访问日志，平移自 Go 端 server/middleware.go 与 server/ip.go。
+// 横切关注点：安全响应头与访问日志，平移自 Go 端 server/middleware.go 与 server/ip.go。
 //
 // 与 Go 的形态差异只有装配位置，不涉及行为：
 // Go 的 accessLog(securityHeaders) 是包装 http.Handler 的中间件，靠 statusRecorder

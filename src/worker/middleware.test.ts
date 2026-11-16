@@ -157,16 +157,75 @@ describe("maskedIP", () => {
     });
   }
 
-  it("任何输入都不把完整地址原样带出去", () => {
-    // 隐私红线的兜底断言：对一批真实形态的输入，输出必须与输入不同且
-    // 不包含输入的后半部分。函数级断言之外再钉一次性质，防止新增分支时
-    // 出现「规范化后原样返回」的意外。
-    const inputs = ["203.0.113.45", "2001:db8:85a3::8a2e:370:7334", "[2001:db8::99]:8443"];
-    for (const input of inputs) {
-      const masked = maskedIP(input);
-      expect(masked).not.toBe(input);
-      expect(input.includes(masked) && masked.includes(".") && !masked.includes("*")).toBe(false);
+  // sensitiveFragments 从输入里取出「本应被遮蔽掉的那些段」，作为断言侧的独立判据。
+  // 这里刻意不复用被测实现的 clientIP：判据若与被测实现共享同一段解析逻辑，
+  // 解析错在哪边就一起错，断言会跟着漂。剥离方括号/端口/zone 的规则在此重写一遍。
+  // IPv4 取第 3、4 段；IPv6 取第 3 组及以后（滤掉压缩产生的空组）。
+  function sensitiveFragments(input: string): string[] {
+    let host = input;
+    if (host.startsWith("[")) {
+      const end = host.indexOf("]");
+      if (end >= 0) {
+        host = host.slice(1, end);
+      }
+    } else if (host.split(":").length === 2) {
+      host = host.slice(0, host.lastIndexOf(":"));
     }
+    const zone = host.indexOf("%");
+    if (zone >= 0) {
+      host = host.slice(0, zone);
+    }
+    const separator = host.includes(":") ? ":" : ".";
+    return host
+      .split(separator)
+      .slice(2)
+      .filter((part) => part !== "");
+  }
+
+  // leaksBeyondPrefix 判断掩码结果里是否混进了本应被遮蔽的段。
+  // 这是「部分泄露」的判据：输出末尾带 * 不代表安全，203.0.113.* 这种
+  // 只遮最后一段的形态同样把网段暴露在外，必须被捕到。
+  //
+  // 用整段比对而不是子串包含：子串判据会被前缀本身误伤——IPv6 的
+  // "1" 是 "2001" 的子串，一句 includes 就会把正确的 2001:db8:::* 判成泄露。
+  // IPv6 段按小写比较：归一后同形（大写输入在实现里已被小写化）。
+  function leaksBeyondPrefix(masked: string, input: string): boolean {
+    const separator = input.includes(":") ? ":" : ".";
+    const maskedSegments = masked
+      .split(separator)
+      .map((segment) => segment.toLowerCase());
+    return sensitiveFragments(input).some((fragment) =>
+      maskedSegments.includes(fragment.toLowerCase())
+    );
+  }
+
+  it("任何输入都不把前缀之后的段带出去", () => {
+    // 表驱动用例逐形态锁期望值；这条对「新增分支时输出形态意外变宽」负责，
+    // 判据不写死具体串，而是从输入反推哪些段必须消失。
+    const inputs = [
+      "203.0.113.45",
+      "198.51.100.7:5566",
+      "2001:db8:85a3::8a2e:370:7334",
+      "[2001:db8::99]:8443",
+      "2001:db8::1%eth0"
+    ];
+    for (const input of inputs) {
+      // 非空是本条的前提：判据若取不到任何敏感段，下面的断言就恒真空转。
+      expect(sensitiveFragments(input).length).toBeGreaterThan(0);
+      expect(leaksBeyondPrefix(maskedIP(input), input)).toBe(false);
+    }
+  });
+
+  it("该判据对部分泄露形态会翻红", () => {
+    // 正控：证明上一条不是恒真断言。把实现换成「只遮最后一段」或
+    // 「只遮后半截分组」的写法时，判据必须给出 true，从而让上一条翻红。
+    expect(leaksBeyondPrefix("203.0.113.*", "203.0.113.45")).toBe(true);
+    expect(leaksBeyondPrefix("203.0.*.45", "203.0.113.45")).toBe(true);
+    expect(leaksBeyondPrefix("2001:db8:85a3::8a2e:370:*", "2001:db8:85a3:0:0:8a2e:370:7334")).toBe(true);
+    // 负控：正确形态与 Go 的 unknown 降级都不触发，避免判据宽到误伤合法输出。
+    expect(leaksBeyondPrefix("203.0.*.*", "203.0.113.45")).toBe(false);
+    expect(leaksBeyondPrefix("2001:db8:::*", "2001:db8:85a3:0:0:8a2e:370:7334")).toBe(false);
+    expect(leaksBeyondPrefix("unknown", "203.0.113.45")).toBe(false);
   });
 });
 
