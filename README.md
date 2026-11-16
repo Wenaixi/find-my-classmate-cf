@@ -24,7 +24,7 @@ FindMyClassmate 是一个面向校园场景的班级查询工具。React + TypeS
 
 ## 快速开始
 
-前置：Node.js 24（CI 使用的版本）、Go 1.26。
+前置：Node.js 26（CI 使用的版本）、Go 1.26。
 
 ```bash
 # 1. 安装前端依赖

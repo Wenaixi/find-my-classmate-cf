@@ -9,7 +9,7 @@ import (
 const (
 	// errCodeNotFound 未知 /api/* 路径。
 	errCodeNotFound = "not_found"
-	// errCodeMethodNotAllowed 非 GET 访问 /api/search（带 Allow 头）。
+	// errCodeMethodNotAllowed 非 GET 访问 /api/* 只读接口（health/search/schools，带 Allow 头）。
 	errCodeMethodNotAllowed = "method_not_allowed"
 	// errCodeInvalidLimit limit 非数字或越界（1-50）。
 	errCodeInvalidLimit = "invalid_limit"

@@ -57,6 +57,26 @@ func TestHealthReflectsDataAvailability(t *testing.T) {
 	}
 }
 
+// /api/health 只接受 GET：非 GET 返回 405 且带 Allow: GET。
+// 与 search/schools 的方法限定同构，防止探针接口成为唯一不声明方法的只读端点。
+func TestHealthMethodNotAllowed(t *testing.T) {
+	store := newTestStore(t, map[string]string{"高一.json": validGradeOne})
+	req := httptest.NewRequest(http.MethodPost, "/api/health", nil)
+	rec := httptest.NewRecorder()
+	buildMux(store, "dev").ServeHTTP(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("POST /api/health 状态 = %d，期望 405", rec.Code)
+	}
+	if allow := rec.Header().Get("Allow"); allow != http.MethodGet {
+		t.Errorf("Allow = %q，期望 GET", allow)
+	}
+	var body map[string]string
+	_ = json.Unmarshal(rec.Body.Bytes(), &body)
+	if body["error"] != errCodeMethodNotAllowed {
+		t.Errorf("error 码 = %q，期望 %q", body["error"], errCodeMethodNotAllowed)
+	}
+}
+
 // 未知 /api/* 路径应返回 JSON 404（not_found），而非 text/plain
 func TestUnknownAPIJSON404(t *testing.T) {
 	store := newTestStore(t, map[string]string{"高一.json": validGradeOne, "高二.json": validGradeTwo})

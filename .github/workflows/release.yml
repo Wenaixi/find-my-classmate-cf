@@ -14,10 +14,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: 安装 Node.js 24
+      - name: 安装 Node.js 26
         uses: actions/setup-node@v7
         with:
-          node-version: 24
+          node-version: 26
           cache: npm
 
       - name: 前端依赖与构建
@@ -49,10 +49,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: 安装 Node.js 24
+      - name: 安装 Node.js 26
         uses: actions/setup-node@v7
         with:
-          node-version: 24
+          node-version: 26
           cache: npm
 
       - name: 安装前端依赖并构建
