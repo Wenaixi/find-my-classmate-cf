@@ -429,6 +429,21 @@ describe("未知 /api/* 与静态回退", () => {
     expectCacheControl(response, NO_STORE, "缺失构建产物");
   });
 
+  // /fonts/ 与 /assets/ 走同一条 isAssetPath 分支，因此缺失产物的改写也必须
+  // 覆盖字体。单独钉这一条的理由是「前缀收敛」：只测 /assets/ 时，把
+  // ASSET_PATH_PREFIXES 收窄成 ["/assets/"] 不会有任何用例翻红——因为真实字体
+  // 是存在的，命中用例照样绿，而 /fonts/missing.woff2 会悄悄退回
+  // 「200 HTML + 一年 immutable」，正是这次修掉的缺陷换了个前缀复活。
+  //
+  // Go 的 web_test.go 对两个前缀各有一条（TestFrontendAssetsImmutableCache /
+  // TestFrontendFontsImmutableCache），这里的缺失侧同样一分为二。
+  it("缺失的 /fonts/* 不带 immutable 且答 404", async () => {
+    const response = await SELF.fetch(request("/fonts/does-not-exist-hash.woff2"));
+
+    expect(response.status).toBe(404);
+    expectCacheControl(response, NO_STORE, "缺失字体");
+  });
+
   // 单页回退在页面路由上生效，但在构建产物路径上必须被改回 404。
   //
   // wrangler.jsonc 的 not_found_handling 会让资产层对任何未命中文件答 index.html
@@ -461,17 +476,27 @@ describe("未知 /api/* 与静态回退", () => {
 
   // "/api" 没有尾斜杠，不落在 "/api/" 前缀里，因此走静态回退。
   //
-  // 这里与 Go 有一处已知差异：Go 的 ServeMux 对「注册了子树却请求子树根且缺
-  // 尾斜杠」的形态会先回 301 并补上斜杠，而本实现直接交给资产层。差异只在
-  // 这一条退化输入上：真实客户端不会请求裸 "/api"，即便请求了，得到的也是
-  // 资产层的 404 而不是 Service Worker 的错误体。保留资产回退而不复刻 301，
-  // 是因为复刻它需要一个只为这一条路径存在的手写跳转，而收益仅是形态对齐。
-  // 这条测试钉住的是判定口径（前缀必须带尾斜杠），防止有人把
-  // isPublicAPIPath 改成 startsWith("/api") 后悄悄改变这条路径的去向。
-  it("/api（无尾斜杠）不归公共 API，走静态回退", async () => {
+  // 这里与 Go 有两处已知差异，都只在这条退化输入上：
+  //   - Go 的 ServeMux 对「注册了子树却请求子树根且缺尾斜杠」的形态会先回 301
+  //     补上斜杠并跳到 /api/，本实现不复刻那个跳转（收益仅是形态对齐）。
+  //   - 改为交资产层之后，答案的具体形态由 not_found_handling 决定：那里没有
+  //     对应文件，SPA 兜底会回首页 HTML **且状态 200**。而在开启 SPA 回退之前，
+  //     它拿到的是资产层的空体 404。也就是说这条路径的状态码被 SPA 回退悄悄
+  //     改过一次。
+  //
+  // 因此断言必须钉状态码，只断「不含 application/json」是不够的——那句在 404
+  // 与 200 两种形态下都成立，改了也测不出来（评审 M2）。这里按当前行为钉成
+  // 200 + text/html，并显式记录它相对 Go 的差异：真实客户端不会请求裸 "/api"，
+  // 若请求了，唯一后果是拿到首页而不是 404。
+  //
+  // 若将来把 SPA 回退改掉或加回 301，这条会翻红——这正是它要提醒的：这条路径
+  // 的语义是部署配置的函数，不只是路由判定的函数。
+  it("/api（无尾斜杠）不归公共 API，走静态回退（当前为 SPA 兜底 200 HTML）", async () => {
     const response = await SELF.fetch(request("/api"));
 
     expect(response.headers.get("Content-Type") ?? "").not.toContain("application/json");
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Content-Type") ?? "").toContain("text/html");
   });
 });
 

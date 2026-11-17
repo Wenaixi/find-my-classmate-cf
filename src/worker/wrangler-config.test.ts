@@ -117,6 +117,13 @@ describe("wrangler.jsonc 部署契约", () => {
     expect([10, 60]).toContain(limiter?.simple?.period);
     expect(limiter?.simple?.limit).toBeGreaterThan(0);
 
+    // limit 必须是 60，不接受「任意正数」。
+    //
+    // 60/60 是与 Go 端 rateCapacity=60 对齐后的目标值，不是随手取的一个上限：
+    // 调大它等于放宽 Go 基线承诺的突发容量，调小则比基线更严，两种都与迁移要
+    // 求的「行为等价」背离。原先只断言 > 0，改成 1000 不会有任何用例翻红。
+    expect(limiter?.simple?.limit).toBe(60);
+
     // VERSION 走 vars：健康检查与 503 都回显它，缺了会答 undefined。
     const vars = config.vars as Record<string, string> | undefined;
     expect(vars?.VERSION).toBeDefined();

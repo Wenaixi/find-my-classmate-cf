@@ -28,8 +28,16 @@ jobs:
       # 用 grep -c 直接数字比对而不是 `grep -q`：-c 给出的是「有几处」，
       # 报错信息能带上数量，排查时不必再手动数一遍。grep 无匹配时退出码为 1，
       # 因此 `|| true` 是必需的，否则守卫会在「零处」这个正确状态下失败。
+      #
+      # 先单独判文件是否存在：grep 对不存在的文件也返回非零，被 `|| true` 兜住后
+      # 会得到空字符串，于是报错信息会变成「含  处 npmmirror」。那种措辞把
+      # 「锁文件没生成」和「锁文件用了镜像源」两件事混成一个，排查方向会跑偏。
       - name: 依赖源守卫（锁文件中不得出现镜像源）
         run: |
+          if [ ! -f package-lock.json ]; then
+            echo "错误：package-lock.json 不存在，依赖安装未完成或锁文件被删。" >&2
+            exit 1
+          fi
           count=$(grep -c npmmirror package-lock.json || true)
           if [ "$count" != "0" ]; then
             echo "错误：package-lock.json 含 $count 处 npmmirror，依赖来源必须是官方 registry。" >&2
@@ -42,6 +50,20 @@ jobs:
 
       - name: 类型检查
         run: npm run typecheck
+
+      # 生产构建必须早于单元测试：worker 集成测试跑的是真实装配链，其中的
+      # firstAssetPath() 从首页 HTML 提取真实的 /assets/* 哈希路径、firstFontPath()
+      # 从 CSS 提取 /fonts/*，这五条用例（非 /api 回退、/assets 长缓存、304、
+      # /fonts 长缓存、单页回退）全部依赖 server/web 里真有一份产物。
+      #
+      # server/web 在 .gitignore 里，`npm ci` 不产出它，package.json 也没有
+      # pretest 钩子——干净检出上先跑 test 必红 5 条，而这 5 条红的信息看起来像
+      # 「静态资源分支坏了」，实际只是构建没跑。实测：移走 server/web 后
+      # npx vitest run src/worker/index.test.ts → 5 failed。
+      #
+      # 顺序因此固定为：npm ci → 守卫 → typecheck → build → test → dry-run。
+      - name: 生产构建
+        run: npm run build
 
       - name: 单元测试
         run: npm test
@@ -58,13 +80,10 @@ jobs:
       - name: secrets 文件脚本自测
         run: node scripts/gen-secrets-file.mjs --self-test
 
-      - name: 生产构建
-        run: npm run build
-
-      # 部署配置校验。必须放在「生产构建」之后：实测 assets.directory 不存在时
+      # 部署配置校验。同样必须在构建之后：实测 assets.directory 不存在时
       # `wrangler deploy --dry-run` 会直接报
       # 「The directory specified by the "assets.directory" field ... does not exist」
-      # 并退出。顺序反过来，这一步会在每次干净检出时都红，而原因与配置无关。
+      # 并退出。
       - name: 部署配置校验（dry-run）
         run: npm run deploy:dry-run
 

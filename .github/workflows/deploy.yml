@@ -30,10 +30,15 @@ jobs:
       - name: 安装依赖
         run: npm ci
 
-      # 与 CI 的守卫同形：本机 npmrc 的 replace-registry-host 会把 lockfile 里的
-      # registry 改回镜像源，带进来就是供应链的镜像依赖。发布流水线上更不容许。
+      # 与 CI 的守卫同形（含文件存在性判断，理由见 ci.yml 同名步骤注释）：
+      # 本机 npmrc 的 replace-registry-host 会把 lockfile 里的 registry 改回镜像源，
+      # 带进来就是供应链的镜像依赖。发布流水线上更不容许。
       - name: 依赖源守卫（锁文件中不得出现镜像源）
         run: |
+          if [ ! -f package-lock.json ]; then
+            echo "错误：package-lock.json 不存在，依赖安装未完成或锁文件被删。" >&2
+            exit 1
+          fi
           count=$(grep -c npmmirror package-lock.json || true)
           if [ "$count" != "0" ]; then
             echo "错误：package-lock.json 含 $count 处 npmmirror，依赖来源必须是官方 registry。" >&2
@@ -44,13 +49,17 @@ jobs:
       - name: 类型检查
         run: npm run typecheck
 
-      - name: 单元测试
-        run: npm test
-
-      # 部署前必须构建：assets.directory 指向 server/web，那是 vite 的产物目录。
-      # 不先构建就 deploy，上传的是一份空资产目录，线上首页会 404。
+      # 构建必须早于测试，理由与 ci.yml 同一条：worker 集成测试的 firstAssetPath()
+      # 与 firstFontPath() 从 server/web 的真实产物里取哈希路径，而 server/web 在
+      # .gitignore 里、`npm ci` 不产出它。顺序反了会在第 7 步就红，tag 永远走不到
+      # 部署，且失败信息看起来像「测试坏了」而不是「流水线坏了」。
+      #
+      # 顺序固定为：npm ci → 守卫 → typecheck → build → test → dry-run → deploy。
       - name: 生产构建
         run: npm run build
+
+      - name: 单元测试
+        run: npm test
 
       # 配置校验先于真实上传：ratelimits 的 period 枚举、assets 目录是否存在、
       # 绑定形状是否合法，都在这一步暴露，而不是在上传那一刻。
@@ -75,15 +84,24 @@ jobs:
       # 改值。转义由 scripts/gen-secrets-file.mjs 里的 JSON.stringify 负责，那句
       # 脚本另有 --self-test 本地验证往返（含引号/反斜杠/换行/中文）。
       #
-      # 每次部署都带这个文件对已存在的 Worker 也安全：值相同即无害覆盖，且保证
-      # 仓库 secret 是 ADMIN_TOKEN 的唯一事实源——轮换只改一处。
+      # 每次部署都带这个文件对已存在的 Worker 也安全：值相同即无害覆盖。
       #
-      # CLOUDFLARE_ACCOUNT_ID 是 wrangler 当前读取的变量名；CF_ACCOUNT_ID 是它的
-      # 废弃别名。
+      # 但也正因为它是「每次覆盖」，这里有两条方向相反、必须同时记住的约束：
+      #   1. ADMIN_TOKEN 的唯一事实源是仓库 secret（见下面 env 的 ADMIN_TOKEN 行）。
+      #      轮换只改这一处。
+      #   2. **不要在 Cloudflare 控制台改这个 secret**。下一次部署会按仓库 secret
+      #      的值把它写回去，控制台上的轮换会在一夜之间被静默回退，而且没有任何
+      #      信号——线上管理端凭据突然变回旧值，看起来像「token 失效」而不是
+      #      「被部署覆盖」。控制台里该 secret 只是部署结果的投影，不是可编辑的事实源。
+      #
+      # 账号 ID 两个名字都注入：wrangler 认 CLOUDFLARE_ACCOUNT_ID 为主名、
+      # CF_ACCOUNT_ID 为已废弃别名。评审指出运维可能按早期文档只配 CF_ACCOUNT_ID，
+      # 那样主名为空会让鉴权拿不到账号 ID。两个都写、优先正式名，两种配置习惯都能跑。
       - name: 部署
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || secrets.CF_ACCOUNT_ID }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID || secrets.CLOUDFLARE_ACCOUNT_ID }}
           ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
         run: |
           set -euo pipefail

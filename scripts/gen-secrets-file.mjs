@@ -27,6 +27,15 @@ function serialize(token) {
 //
 // 断言的是「往返」，不是「文件里有什么」：前者才是调用方真正依赖的性质
 // （wrangler 会读回同一个值），后者只锁定当前实现的字节形态。
+//
+// 已知边界（自证式自测）：这里只证明「JSON.stringify 写出的内容能被 JSON.parse
+// 读回原值」，没有经过 wrangler 自己的解析路径（parseBulkInputToObject：
+// 先试 JSON.parse、失败再退 dotenv）。两者在"合法 JSON"这一档上等价，但若
+// wrangler 将来改了 secrets 文件的解析规则（比如改为 JSON5、拒绝某些字符），
+// 这条自测不会翻红，而部署会。
+// 不补这条路的原因是成本：在自测里调用 wrangler 的内部函数要么 import 一个
+// 未导出的模块，要么起一次真实 deploy——前者是未稳定 API，后者需要凭据。
+// 因此把它记在这里，替代方案是首次真实部署时的「管理端 401」作为实况信号。
 function selfTest() {
   const tricky = 'a"b\\c$d${HOME}\nef 中文 \t end';
   const file = join(tmpdir(), `fmc-secrets-selftest-${process.pid}.json`);
