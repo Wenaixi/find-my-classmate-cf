@@ -15,6 +15,23 @@
 // - assets 的 directory 指向构建产物实际目录（Ruling 1）。server/web 是
 //   Go 侧内嵌的前端构建输出，也是迁移期唯一存在的构建产物目录；Task 19 删 Go
 //   时改为 dist。
+//
+// - assets 的 run_worker_first 必须为 true，这不是可选项：
+//
+//   平台默认行为是「请求命中静态文件时直接由 Asset Worker 服务，不调用 Worker
+//   脚本」。那样 /、/assets/*、/fonts/*、/favicon.png 全部绕过本 Worker，
+//   于是三类本任务明确承诺的行为同时失效——六条安全头不铺（资产层只给
+//   Content-Type / Cache-Control / ETag，没有 CSP、X-Frame-Options）、
+//   公共限流不生效、访问日志不写。Go 基线里 securityHeaders 与 rateLimit 对
+//   所有路径都生效，只有 true 能保住这条。
+//
+//   用 true 而不是 ["/api/*"]：白名单形态会让静态资源继续绕过 Worker，与
+//   「其余请求交给 env.ASSETS.fetch 分流」的设计不同形，也把限流与安全头
+//   重新变成 API 专属。
+//
+//   注意这条自测不出来：SELF.fetch 直接代理到默认导出的 fetch，天然绕过
+//   assets 路由层。因此 index.test.ts 里另有一条读本文件、断言
+//   run_worker_first === true 的配置用例（见「部署配置契约」一组）。
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "find-my-classmate-cf",
@@ -37,7 +54,8 @@
   ],
   "assets": {
     "directory": "./server/web",
-    "binding": "ASSETS"
+    "binding": "ASSETS",
+    "run_worker_first": true
   },
   "vars": {
     "VERSION": "dev"

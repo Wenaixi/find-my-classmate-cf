@@ -85,20 +85,62 @@ function rateLimited(): Response {
   return writeError(ERR_CODES.rateLimited, { "Retry-After": RETRY_AFTER_SECONDS });
 }
 
-// withSecurityHeaders 把全站安全头铺到任何响应上。
+// 静态产物的长缓存头，逐字对齐 Go 端 config.go 的 assetCacheMaxAge。
+//
+// 取值不可改：构建产物是哈希命名的，内容变则文件名变，因此一年长缓存是安全的，
+// 也是首屏性能依赖的前提。改短它会让每次回访都重新下载哈希资源。
+const ASSET_CACHE_MAX_AGE = "public, max-age=31536000, immutable";
+
+// 静态产物的路径前缀，对齐 Go 端 web.go 里判定 immutable 的那两个前缀。
+// 只有这两个前缀下的文件是构建产物；其余路径（首页、任意回退路径）不设长缓存。
+const ASSET_PATH_PREFIXES = ["/assets/", "/fonts/"] as const;
+
+// isAssetPath 判定路径是否属于构建产物。前缀列表与 ASSET_PATH_PREFIXES 同源，
+// 不在调用点重写字面量。
+function isAssetPath(pathname: string): boolean {
+  return ASSET_PATH_PREFIXES.some((prefix) => pathname.startsWith(prefix));
+}
+
+// withSecurityHeaders 把全站安全头铺到任何响应上，并处理静态产物的缓存头。
 //
 // 用复制而不是就地改 response.headers：ASSETS.fetch 返回的是平台响应，它的
-// headers 是不可变（guarded）的，就地 set 会抛 TypeError。复制时保留 body
+// headers 是受保护的（不可变），就地 set 会抛 TypeError。复制时保留 body
 // 引用（不读不缓存），避免把静态资源整体读进内存。
 //
-// 无 body 的状态码（101/204/304）必须显式传 null body：给 Response 构造器
-// 传一个流会让它抛「Response with null body status cannot have body」，
-// 而 304 正是静态资源条件请求会走到的状态。
-function withSecurityHeaders(response: Response): Response {
+// Cache-Control 是这一层唯一的例外，因为它有两套互斥的正确值：
+//
+//   /assets/ 与 /fonts/  构建产物 → public, max-age=31536000, immutable
+//   其余（首页、API）             → no-store
+//
+// 这个分支是对齐 Go 的 web.go 与 middleware.go：Go 里 setSecurityHeaders 先设
+// no-store，静态资源的 143 行再覆盖成 immutable，后写者胜。Workers 这一层是
+// 后处理，方向相反，因此必须显式按路径选值，不能指望上游。
+//
+// 为什么不「保留上游 Cache-Control」：实测 env.ASSETS.fetch 对 /assets/* 返回的
+// 是 public, max-age=0, must-revalidate（不是 immutable）。直接保留会让构建产物
+// 失去长缓存，与 Go 的 assetCacheMaxAge 分叉。上游那个值只表达「可缓存但须回源
+// 校验」，与 Go 的语义不同。
+//
+// 缺失资源不继承 immutable：Go 的 web.go 只在确认资源存在后设长缓存，
+// 缺失的 /assets/* 走 404 且不带 immutable（static_cache_test.go 有两条锁这个）。
+// 这里用 status 判定复刻同一事实：非 200 的响应不设长缓存，改铺 no-store。
+//
+// 无 body 的状态码（204/304）必须显式传 null body：给 Response 构造器传一个
+// 非 null body 会抛「Invalid response status code」，而 304 正是静态资源条件
+// 请求会走到的状态（ETag + If-None-Match）。
+//
+// 不提 101：实测 `new Response(null, { status: 101 })` 直接抛错（status 必须在
+// 200-599 之间）。它不可能出现在这条链的响应里，留着那半个判定只会让读者以为
+// 还有一条需要处理的分支。
+function withSecurityHeaders(request: Request, response: Response): Response {
   const headers = new Headers(response.headers);
   setSecurityHeaders(headers);
-  const body =
-    response.status === 101 || response.status === 204 || response.status === 304 ? null : response.body;
+  // setSecurityHeaders 已按全站契约铺了 no-store；静态产物命中成功响应时
+  // 用同一个 set 覆盖成 immutable——与 Go 的「后写者胜」等价，只是显式选值。
+  if (isAssetPath(new URL(request.url).pathname) && response.status === 200) {
+    headers.set("Cache-Control", ASSET_CACHE_MAX_AGE);
+  }
+  const body = response.status === 204 || response.status === 304 ? null : response.body;
   return new Response(body, { status: response.status, statusText: response.statusText, headers });
 }
 
@@ -213,7 +255,8 @@ async function handler(request: Request, env: Env): Promise<Response> {
   }
 
   // 安全头最外：无论是 429、404 还是异常转换出的 500，都要带上全站安全头。
-  return withSecurityHeaders(response);
+  // request 也传进去：静态产物的长缓存头要按路径判定（见 withSecurityHeaders）。
+  return withSecurityHeaders(request, response);
 }
 
 // fetch 是 Workers 入口。ctx 保留但当前不使用：本层没有需要 waitUntil 延后的

@@ -1,4 +1,4 @@
-﻿/// <reference types="@cloudflare/vitest-plugin/types" />
+/// <reference types="@cloudflare/vitest-plugin/types" />
 // workerd 集成测试：用 cloudflare:test 的 SELF.fetch 打真实装配链，覆盖
 // 路由分流、限流短路、错误边界与安全头契约。
 //
@@ -67,26 +67,53 @@ import type { RateLimit } from "@cloudflare/workers-types";
 // 与 errors.ts / handlers.ts 同一份 JSON Content-Type。
 const jsonContentType = "application/json; charset=utf-8";
 
-// 六个安全头，逐字对齐 middleware.ts 的 SECURITY_HEADERS。
-// 集成层用「存在且值正确」而不是「非空」：值被改宽松（例如 Permissions-Policy
-// 丢掉 camera 禁用）同样要让这条翻红。
+// 六个安全头里，Cache-Control 不进这份常量。
+//
+// 理由：它不是「全站统一值」，而是按响应类型分两套——构建产物（/assets/、
+// /fonts/）是 public, max-age=31536000, immutable，其余路径是 no-store。
+// 把它留在统一常量里，等于把「静态产物被覆盖成 no-store」这个 bug 写成期望值。
+// 因此其余五条用 expectSecurityHeaders 统一断言，Cache-Control 由
+// expectCacheControl 按路径分别断言。
 const EXPECTED_SECURITY_HEADERS: Record<string, string> = {
   "Content-Security-Policy":
     "default-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; font-src 'self'; style-src 'self' 'unsafe-inline'",
   "X-Frame-Options": "DENY",
   "Referrer-Policy": "no-referrer",
   "Permissions-Policy": "geolocation=(), microphone=(), camera=()",
-  "X-Content-Type-Options": "nosniff",
-  "Cache-Control": "no-store"
+  "X-Content-Type-Options": "nosniff"
 };
 
-// expectSecurityHeaders 断言全站安全头齐备且值逐字正确。
+// 构建产物的一年长缓存头，逐字对齐 Go 端 config.go 的 assetCacheMaxAge。
+const ASSET_CACHE_MAX_AGE = "public, max-age=31536000, immutable";
+
+// 非构建产物路径的缓存头，对齐 middleware.ts 的 setSecurityHeaders。
+const NO_STORE = "no-store";
+
+// expectSecurityHeaders 断言五条统一安全头齐备且值逐字正确，外加 Cache-Control。
+//
+// Cache-Control 的期望值由 cacheControl 参数给出，默认 no-store：绝大多数响应
+// （API、错误、401、首页）都该是它。构建产物必须显式传 ASSET_CACHE_MAX_AGE——
+// 这样「哪个响应该长缓存」在每条用例处都是可见的决定，而不是被一个隐藏默认值
+// 悄悄抹平。
+//
 // 抽成函数是因为它要贴在每一条状态码上反复使用：200 / 429 / 404 / 401，
 // 哪一条漏了断言，那条响应就成了头部契约的例外。
-function expectSecurityHeaders(response: Response, label: string): void {
+function expectSecurityHeaders(
+  response: Response,
+  label: string,
+  cacheControl: string = NO_STORE,
+): void {
   for (const [name, value] of Object.entries(EXPECTED_SECURITY_HEADERS)) {
     expect(response.headers.get(name), `${label} 缺安全头 ${name}`).toBe(value);
   }
+  expect(response.headers.get("Cache-Control"), `${label} 的 Cache-Control`).toBe(cacheControl);
+}
+
+// expectCacheControl 断言 Cache-Control 取到了该路径对应的那一套值。
+// 单独成函数是为了让「构建产物长缓存 / 其余 no-store」这条分叉在每条用例里
+// 都成为显式断言，而不是被一个统一常量抹平。
+function expectCacheControl(response: Response, expected: string, label: string): void {
+  expect(response.headers.get("Cache-Control"), `${label} 的 Cache-Control`).toBe(expected);
 }
 
 // rosterJson 构造上游 build_hierarchy_json.py 形状的名单原文。
@@ -253,19 +280,71 @@ describe("未知 /api/* 与静态回退", () => {
     expectSecurityHeaders(response, "api 404");
   });
 
-  it("非 /api 路径回退 ASSETS 并由资产层给出响应", async () => {
-    // 断言「请求确实走进了 assets binding」而不是钉死静态文件内容：assets 目录
-    // 的产物随构建变化，钉死文件名或正文会让这条测试跟着构建产物抖动。真正的
-    // 契约是分流——首页由资产层服务（text/html 或 404 页面），不是 Worker 的
-    // JSON 错误体。因此这里断言响应不是 application/json 且不带 Worker 的错误码。
+  it("非 /api 路径回退 ASSETS，且 Worker 只是透传（对照直取）", async () => {
+    // 这条用「同一路径分别经装配链与 env.ASSETS.fetch 直取，比对结果」的方式
+    // 钉住分流，而不是靠断言「正文是真 HTML」：
+    //
+    // 1. 旧写法只查「不是 application/json」「有 X-Frame-Options」——资产层给不
+    //    出的 404 空体恰好三条都满足，把 server/web 整体移走后全过。这是 review
+    //    实测出来的失效点（I3）。
+    // 2. 硬断言 text/html + 200 同样不稳：CI 里 npm test 早于构建，产物可能
+    //    根本不存在，那时两边都是 404，而测试会因为断言 200 而假红。
+    //
+    // 对照只比对**真正透传**的部分：status 与 Content-Type。不比对
+    // Cache-Control——它恰恰是装配层按路径主动覆盖的头（构建产物改成
+    // immutable，其余 no-store），与直取的上游值本来就不同；拿它做等式会把
+    // 「装配层做了一层转换」当成透传失败。缓存头的正确性由下面三条专门用例锁。
+    //
+    // 两边同源，所以「产物在、都命中 200」与「产物缺、都 404」都成立；它真正
+    // 承重的是「装配链走的就是这个 assets binding」——把 dispatch 里的
+    // env.ASSETS.fetch 换成任何别的响应来源，等式立刻破裂。
+    for (const path of ["/", "/assets/index-CPmbohEI.js"]) {
+      const viaWorker = await SELF.fetch(request(path));
+      const direct = await env.ASSETS.fetch(new Request(`https://fmc.example${path}`));
+
+      expect(viaWorker.status, `${path} 状态应与直取一致`).toBe(direct.status);
+      expect(viaWorker.headers.get("Content-Type"), `${path} Content-Type 应与直取一致`).toBe(
+        direct.headers.get("Content-Type"),
+      );
+      // 即便资产层答 404，Worker 仍需铺五条统一安全头：这证明响应确实经过了
+      // 装配层而没有被绕过。artifact 分支的长缓存另由专门用例覆盖。
+      for (const [name, value] of Object.entries(EXPECTED_SECURITY_HEADERS)) {
+        expect(viaWorker.headers.get(name), `${path} 缺安全头 ${name}`).toBe(value);
+      }
+    }
+  });
+
+  // 构建产物的一年长缓存（对齐 Go 的 assetCacheMaxAge）。
+  // 文件名带哈希且会随构建变化，因此从 / 的 HTML 里取出真实的 /assets/ 引用，
+  // 而不是硬编码 index-CPmbohEI.js——硬编码会随构建产物一起腐烂。
+  it("/assets/* 命中后带一年 immutable 长缓存", async () => {
+    const page = await SELF.fetch(request("/"));
+    const html = await page.text();
+    const match = html.match(/\/assets\/[A-Za-z0-9._-]+\.(?:js|css)/);
+    // 产物缺失时不跳过断言，而是明确失败：这条用例的价值就在于锁缓存头，
+    // 静默跳过会让「产物没构建」伪装成通过。
+    expect(match, "首页未引用任何 /assets/* 构建产物").not.toBeNull();
+
+    const response = await SELF.fetch(request(match![0]));
+    expect(response.status).toBe(200);
+    expectCacheControl(response, ASSET_CACHE_MAX_AGE, `构建产物 ${match![0]}`);
+    expectSecurityHeaders(response, "构建产物 200", ASSET_CACHE_MAX_AGE);
+  });
+
+  // 缺失的构建产物不得继承一年长缓存：Go 的 web.go 只在确认资源存在后设
+  // immutable（static_cache_test.go 有两条锁这个）。这里用 status 判定复刻。
+  it("缺失的 /assets/* 不带 immutable", async () => {
+    const response = await SELF.fetch(request("/assets/does-not-exist-hash.js"));
+
+    expect(response.status).toBe(404);
+    expectCacheControl(response, NO_STORE, "缺失构建产物");
+  });
+
+  // 首页不是构建产物：一年长缓存会让用户永远看到旧页面。
+  it("首页 / 为 no-store（不继承产物长缓存）", async () => {
     const response = await SELF.fetch(request("/"));
 
-    expect(response.headers.get("Content-Type") ?? "").not.toContain("application/json");
-    // 安全头必须照样齐全：静态回退的响应同样过最外层 setSecurityHeaders。
-    // 这条是装配顺序的第二个证据面（第一个是 429 那条）。
-    expect(response.headers.get("X-Frame-Options")).toBe("DENY");
-    const text = await response.text();
-    expect(text).not.toContain('"error":"not_found"');
+    expectCacheControl(response, NO_STORE, "首页");
   });
 
   // "/api" 没有尾斜杠，不落在 "/api/" 前缀里，因此走静态回退。
