@@ -8,6 +8,11 @@ on:
     tags:
       - "v*"
 
+# 顶层权限收窄到只读：部署靠 CLOUDFLARE_API_TOKEN（环境变量），不需要 GitHub
+# 的仓库写权限。迁移删掉 Go/Docker job 时原本有这条，一并删掉了，现在补回。
+permissions:
+  contents: read
+
 # 同一时刻只允许一个部署，且不取消进行中的那个：
 # 部署是替换线上版本，两个并发部署交错会让「哪个版本在线上」变得不可判定。
 concurrency:

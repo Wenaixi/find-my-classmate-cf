@@ -5,6 +5,12 @@ on:
     branches: [main, master]
   pull_request:
 
+# 顶层权限收窄到只读：CI 只读仓库内容（checkout），不上传 artifact、不写
+# Release、不碰仓库写权限。迁移删掉 Go/Docker job 时这条一起被删掉了，现在
+# 补回——默认的 token 权限比这宽，收窄后即使某个 step 被注入也写不了仓库。
+permissions:
+  contents: read
+
 jobs:
   frontend:
     name: 前端 + Worker · 依赖守卫 / 类型检查 / 构建 / 测试 / 部署配置校验
