@@ -45,7 +45,7 @@ export function App({ api, schoolsApi }: AppProps = {}) {
   // 卸载时中止在途请求（竞态编排归属 useSearchController 内部 session）
   useEffect(() => () => controller.abortAll(), []);
 
-  // 页脚版本号：读 /api/health（ldflags 注入的运行时版本），失败静默隐藏。
+  // 页脚版本号：读 /api/health（`VARS.VERSION`，部署时由 --var 注入），失败静默隐藏。
   useEffect(() => {
     const controller = new AbortController();
     fetchVersion(controller.signal).then(setVersion).catch(() => {});

@@ -176,8 +176,8 @@ describe("班级与年段精度", () => {
   });
 
   it("姓名含「高」「班」字不被误判为年段或班级", () => {
-    const students = [roster("高翔", "高一", "1班", 1), roster("班长", "高二", "2班", 2)];
-    expect(Search(students, "高翔", PAGE_SIZE, 0).items.length).toBe(1);
+    const students = [roster("高小明", "高一", "1班", 1), roster("班长", "高二", "2班", 2)];
+    expect(Search(students, "高小明", PAGE_SIZE, 0).items.length).toBe(1);
     expect(Search(students, "班长", PAGE_SIZE, 0).items.length).toBe(1);
   });
 
@@ -453,7 +453,7 @@ function corpusStudents(): RosterStudent[] {
     newStudentSchool("福清一中", "示例同学", "高三", "18班", 18, 0),
     newStudentSchool("福清二中", "李四", "高二", "3班", 3, 1),
     newStudentSchool("福清二中", "王五", "高二", "11班", 11, 1),
-    newStudentSchool("福清二中", "高翔", "高一", "11班", 11, 1),
+    newStudentSchool("福清二中", "高小明", "高一", "11班", 11, 1),
     newStudentSchool("福清二中", "高一鸣", "高一", "2班", 2, 1),
     newStudentSchool("福清二中", "班长", "高二", "2班", 2, 1),
     newStudentSchool("福清二中", "高一同学", "高一", "3班", 3, 1),

@@ -364,10 +364,14 @@ export const searchStateValues = ["idle", "editing", "loading", "success", "dupl
 // 报错形态刻意带出缺失项本身（缺 "pending" 时退化为 { missing: "pending" }），
 // 而不是让 Exclude 得 never 后报一条无从解读的 never 不兼容。
 //
-// 检查必须落在非测试文件：.dockerignore 排除 src/**/*.test.ts，
-// 放进测试文件则容器镜像构建的 tsc -b 不再检查它，会造出一条「本地绿、镜像不查」
-// 的隐形防线。searchStateValues 在生产中无人消费，但 tsconfig.app.json 未开
-// noUnusedLocals，声明本身不报错。
+// 检查必须落在非测试文件。理由是**不依赖巧合**：`tsconfig.app.json` 的 include 是
+// `["src"]`，测试文件本来也在类型检查范围内，所以放进测试文件今天同样会被检查——
+// 但那条依赖是巧合，不是契约。谁挪一下 exclude，或把这个文件换到别的编译项目里，
+// 检查就静默失效，而失效的表现是「什么都不会发生」。放在生产代码里则是硬约束：
+// 任何人编译本仓都必然读到它。（历史注记：此前这条理由写的是「.dockerignore 排除
+// src/**/*.test.ts」，那份文件已随 Docker 退役删除，论据换成上面这条。）
+// searchStateValues 在生产中无人消费，但 tsconfig.app.json 未开 noUnusedLocals，
+// 声明本身不报错。
 type SearchStateGap = Exclude<SearchState, (typeof searchStateValues)[number]>;
 const searchStateExhaustive: SearchStateGap extends never ? true : { missing: SearchStateGap } = true;
 void searchStateExhaustive;

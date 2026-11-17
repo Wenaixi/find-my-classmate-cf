@@ -472,8 +472,8 @@ async function runSelfTest() {
     }
   };
 
-  const schoolA = { 校名: "福清一中", 年级: [{ 年级名: "高一", 班级: [{ 班名: "一班", 学生: [{ 姓名: "陈瑾欣" }] }] }] };
-  const schoolB = { 校名: "福清二中", 年级: [{ 年级名: "高一", 班级: [{ 班名: "二班", 学生: [{ 姓名: "林安宁" }] }] }] };
+  const schoolA = { 校名: "福清一中", 年级: [{ 年级名: "高一", 班级: [{ 班名: "一班", 学生: [{ 姓名: "张三" }] }] }] };
+  const schoolB = { 校名: "福清二中", 年级: [{ 年级名: "高一", 班级: [{ 班名: "二班", 学生: [{ 姓名: "李四" }] }] }] };
 
   check("单校文件拆出 1 份子文档", () => {
     const docs = extractSchoolDocuments(JSON.parse(roster("福清市", [schoolA])), "single.json");
@@ -680,7 +680,36 @@ async function runSelfTest() {
   if (failures > 0) {
     throw new Error(`${failures} 条自测失败`);
   }
-  console.log(`自测全部通过（${pending.length} 条）`);
+  // fixture 姓名白名单：自测里的所有姓名必须来自这一组合成名。真实姓名进 fixture
+  // 是曾经发生过的红线突破（4 个在校生姓名进了 fixture，零数据守卫只查文件名，
+  // 结构性看不见字面量）。CI 里没有 data/ 可比对，所以这条断言是仓库侧能自己
+  // 守住的那一道：改 fixture 时若写了真名，白名单外的新名字会让它翻红。
+  //
+  // 检查方式是把本文件全文里的姓名位置抽出来，只允许白名单成员。抽的是
+  // `姓名: "..."` 与 `["1班", ["张三", ...]]` 两种 fixture 写法，覆盖本文件现状；
+  // 新增别的写法时这条断言会漏，届时按新写法补一条正则。
+  const allowedFixtureNames = new Set([
+    "张三", "李四", "王五", "赵六", "王芳", "李雷", "韩梅梅",
+    "小明", "小红", "示例甲", "示例乙", "测试甲", "测试乙", "高小明",
+  ]);
+  const sourceText = await readFile(new URL(import.meta.url), "utf8");
+  // 匹配式用转义拼出来：若源码里直接写「姓名: "…"」，本段自己也会被当成 fixture
+  // 抓出来（第一版就这样自噬，把匹配式本身报成白名单外的姓名）。
+  const nameField = "\u59d3\u540d"; // 「姓名」，转义写法让源码里不出现紧邻的明文
+  // 只认真正在声明 fixture 的行：以 `const schoolA`／`const schoolB` 开头。
+  // 注释里举例的「姓名: "..."」不会被算进来（第一版把它们也抓了）。
+  const declaredNames = sourceText
+    .split("\n")
+    .filter((line) => line.trimStart().startsWith("const school"))
+    .flatMap((line) => [...line.matchAll(new RegExp(nameField + ': "([^"]+)"', "g"))])
+    .map((match) => match[1]);
+  const strayNames = declaredNames.filter((name) => !allowedFixtureNames.has(name));
+  if (strayNames.length > 0) {
+    throw new Error(
+      `fixture 姓名不在合成名白名单：${strayNames.join("、")}（真实姓名不得写入 fixture）`,
+    );
+  }
+  console.log(`自测全部通过（${pending.length} 条），fixture 姓名 ${declaredNames.length} 处全在合成名白名单内`);
 }
 
 // main 是进程入口：自测只跑纯逻辑，正常模式跑整轮上传，最后统一翻译成退出码。

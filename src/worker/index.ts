@@ -159,9 +159,11 @@ function withSecurityHeaders(request: Request, response: Response): Response {
 // "/api/"，它匹配 "/api/" 与其下的所有路径，裸 "/api"（缺尾斜杠）则不在其中。
 // 写成 startsWith("/api") 会把裸 "/api" 从静态回退里挖出来答 JSON 404。
 //
-// 与 Go 的一处已知差异：Go 的 ServeMux 对「子树根缺尾斜杠」会补一个 301 跳转，
-// 本实现直接把裸 "/api" 交给资产层。只影响这一条退化输入，真实客户端不会
-// 请求它；为它复刻 301 需要一条手写跳转分支，收益只是形态对齐。
+// 与 Go 的一处已知差异：Go 的 ServeMux 对「子树根缺尾斜杠」会补一个 **307**
+// （不是 301——`net/http` 的 matchOrRedirect 用 `StatusTemporaryRedirect`，
+// 实测 `path=/api` 得 status=307、location="/api/"），本实现直接把裸 "/api"
+// 交给资产层。只影响这一条退化输入，真实客户端不会请求它；为它复刻 307
+// 需要一条手写跳转分支，收益只是形态对齐。
 function isPublicAPIPath(pathname: string): boolean {
   return pathname.startsWith("/api/");
 }
@@ -231,6 +233,13 @@ async function dispatch(request: Request, env: Env, pathname: string): Promise<R
 
 // asResponse 把异常收窄成响应：ApiException 走它自己的 toResponse（状态与
 // 错误体由抛出点决定），其余一律 500 internal_error。
+//
+// **ApiException 分支当前不可达**：生产代码里没有任何 handler 抛它——三条公共
+// handler 都是直接 `return Response`，管理端也是。它是有意保留的预留通道，
+// 不是死代码的遗留物：API 层若要表达「这里出错但状态与错误码由调用点决定」，
+// 抛 ApiException 比让每个 handler 自己拼 Response 更不容易分叉。通道保留的
+// 代价只有一次 instanceof 判定，而删掉它会让将来新增的抛出点必须先改装配层。
+// 别把它读成「当前有异常路径在跑」——没有。
 //
 // 500 的码是字面量而不是 ERR_CODES 的成员：internal_error 只在「这里出了
 // 未预期的异常」一个场景出现，它不属于对外错误码契约（ERR_STATUS 的那些码

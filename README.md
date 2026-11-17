@@ -58,12 +58,23 @@ node scripts/upload-roster.mjs http://127.0.0.1:8787 <token> data
 ```bash
 # 登录（或改用 CLOUDFLARE_API_TOKEN 环境变量给 CI 用）
 npx wrangler login
-
-# 管理端凭据：值为任意长随机串，只写进 Cloudflare，不进仓库
-npx wrangler secret put ADMIN_TOKEN
 ```
 
+管理端凭据 `ADMIN_TOKEN` 的写入时机见下一节：**Worker 还不存在时 `secret put` 无法成功**，首次要跟 `--secrets-file` 一起部署。
+
 `wrangler.jsonc` 里的 `kv_namespaces` 只声明 binding 名 `ROSTER`、不写 id——id 是账号内的资源标识，写死会把「哪个账号部署」绑进仓库。
+
+**首次 `secret put` 不能排在部署之前。** `wrangler` 在 Worker 还不存在时无法给它写 secret（worker 不存在就没有可写 secret 的目标），官方给出的出路是 `--secrets-file`：
+
+```bash
+# 首次：用 --secrets-file 一并带上 secret，Worker 与 secret 在同一次部署里落地
+# gen-secrets-file.mjs 从环境变量 ADMIN_TOKEN 取值，写成 0600 的 JSON 文件
+ADMIN_TOKEN='<随机串>' node scripts/gen-secrets-file.mjs ./fmc-secrets.json
+npx wrangler deploy --secrets-file ./fmc-secrets.json
+rm ./fmc-secrets.json
+```
+
+Worker 已经存在之后，`npx wrangler secret put ADMIN_TOKEN` 才是可用的（日常轮换走 `deploy.yml` 注入，见下）。
 
 首次部署**在本地跑** `npx wrangler deploy`，wrangler 会按 binding 名创建 KV namespace 并把 `id` 回写进 `wrangler.jsonc`，**把那一行 id 提交进仓库**。这样之后 CI 与本地读的是同一份显式事实。
 

@@ -2,7 +2,9 @@ import type { Grade, SearchResponse, Student } from "../types";
 import { REQUEST_TIMEOUT_MS } from "../config";
 
 // ApiStudent 是 /api/search 的 wire 形状，仅在本模块内用于解码。
-// 服务端 canonical 字段是 class（search.go json:"class"），className 永不出现在序列化中。
+// 服务端 canonical 字段是 class（wire 契约的一部分），className 只存在于前端领域形状，
+// 永不出现在序列化中。
+
 interface ApiStudent {
   name?: unknown;
   school?: unknown;
@@ -10,15 +12,14 @@ interface ApiStudent {
   class?: unknown;
 }
 
-// decodeItem 不在前端复制年段取值域：后端 knownGrades 是规范名的唯一事实源。
-// 若前端硬编码一份年段清单，后端新增年段后前端会把全部响应判为 invalid-response，
-// 表现为"后端数据正常但全站查询失败"。因此这里只校验 grade 是非空字符串，
-// 值域正确性由后端保证；空串、缺失与非字符串仍被拒绝。
+// decodeItem 不在前端复制年段取值域：唯一事实源是 shared/grades.ts（types.ts 只
+// re-export Grade，这里 import 的就是那一份）。若前端硬编码一份年段清单，扩展年段后
+// 旧清单会把全部响应判为 invalid-response，表现为「数据正常但全站查询失败」。
+// 因此这里只校验 grade 是非空字符串，值域正确性由那唯一一份声明与它的编译期检查保证；
+// 空串、缺失与非字符串仍被拒绝。
 //
-// 注意「扩展年段」的义务不止 knownGrades 一处：前端 types.ts 的 Grade 联合与
-// query.ts 的 gradeValues 也须同步（加别名时两端 gradeAliases 亦然），
-// 共四处。清单与各处的强制机制见 docs/ARCHITECTURE.md 的年段值域小节，
-// 此处不复述——清单会随代码增删而腐化。
+// 扩展年段只改 grades.ts 一处（Grade 联合、gradeValues，加别名再改 gradeAliases），
+// 本文件不需要跟着改——旧注释里「共四处同步」的说法随 Go 退役已不成立。
 
 // decodeItem 把一条 wire 记录收敛为合法领域形状，或返回 null 表示不可接受。
 // 只接受 canonical class 单字段：缺字段、类型错误与空串都不静默降级，
@@ -66,7 +67,8 @@ function combineSignals(a?: AbortSignal, b?: AbortSignal): AbortSignal | undefin
   return controller.signal;
 }
 
-// 读取运行时版本（/api/health 由 ldflags 注入 main.version，200 与 503 degraded 均携带）。
+// 读取运行时版本（/api/health 由 `VARS.VERSION` 提供：wrangler.jsonc 的 vars 是本地
+// 默认值 `dev`，部署时 `--var VERSION:<tag>` 覆盖；200 与 503 degraded 均携带）。
 // 展示为尽力而为：失败由调用方静默忽略。
 export async function fetchVersion(signal?: AbortSignal): Promise<string> {
   const combined = combineSignals(signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS));

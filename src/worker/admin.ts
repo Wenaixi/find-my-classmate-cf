@@ -34,10 +34,15 @@ const ERR_UNAUTHORIZED = "unauthorized";
 // 处置动作不同。message 字段承载 shared/roster.ts 的逐字文案。
 const ERR_INVALID_ROSTER = "invalid_roster";
 
-// 管理端的根路径。isAdminPath 与 handler 共用同一份前缀：两处各写一份
+// 管理端根路径。isAdminPath 与 handler 共用同一份前缀：两处各写一份
 // 字面量后，改前缀只会改到一处，另一处静默失配——装配层不再把管理请求
 // 路由到这里，而 handler 还以为自己收到了管理请求。
 const ADMIN_PREFIX = "/api/admin/roster";
+
+// 上传 body 的预检上限：KV 单值上限 25 MiB（官方 Limits 页，Free 与 Paid 相同）。
+// 与 rosterStore 的键名上限同族——都是把「平台会拒绝的事」在本地提前拦成
+// 一条可读的 400，而不是让管理员等平台抛出原始错误文本。
+const MAX_ROSTER_BYTES = 25 * 1024 * 1024;
 
 // Authorization 头的解析形态：scheme 大小写不敏感（RFC 7235 规定
 // auth-scheme 不区分大小写，客户端发 bearer 与 Bearer 必须同等接受），
@@ -254,6 +259,21 @@ export async function adminHandlers(request: Request, ctx: AdminContext): Promis
   }
 
   if (request.method === "PUT") {
+    // body 大小预检：`request.text()` 会把整个请求体读进内存，而上传端点是唯一
+    // 接受大 body 的地方。没有预检时，一个学生数远超实际的名单会被完整读入后
+    // 才在解析或 KV 写入处失败。这里按 Content-Length 提前拦下——它是声明值，
+    // 不校验真实性（chunked 请求没有这个头，会落到下面的正常读取路径，由平台
+    // 的值大小上限兜底）。
+    //
+    // 上限取 KV 单值上限 25 MiB：真正超限的写入平台本来也会拒绝，提前拦只是把
+    // 「先读完再报错」变成「不读就报错」。这条是低成本防线，不是完整性校验。
+    const declaredLength = Number(request.headers.get("content-length") ?? "0");
+    if (Number.isFinite(declaredLength) && declaredLength > MAX_ROSTER_BYTES) {
+      return writeJSON(400, {
+        error: ERR_INVALID_ROSTER,
+        message: `名单超过大小上限（${MAX_ROSTER_BYTES} 字节）`,
+      });
+    }
     const payload = await request.text();
     try {
       const { students } = await ctx.store.putRoster(school, payload);

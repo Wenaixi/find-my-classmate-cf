@@ -390,10 +390,10 @@ describe("parseRosterDocument 去重键", () => {
 
   it("姓名归一化后相同（「张 三」与「张三」）只加载一条", () => {
     const students = parseSingleDocument(
-      documentJson([{ 校名: "福清一中", 年级名: "高一", 班级: [["1班", ["张三", "张 三", "王皓轩"]]] }]),
+      documentJson([{ 校名: "福清一中", 年级名: "高一", 班级: [["1班", ["张三", "张 三", "王五"]]] }]),
       "高一.json",
     );
-    expect(students.map((student) => student.name)).toEqual(["张三", "王皓轩"]);
+    expect(students.map((student) => student.name)).toEqual(["张三", "王五"]);
   });
 
   it("同名同班号但不同学校不去重：去重键含学校", () => {

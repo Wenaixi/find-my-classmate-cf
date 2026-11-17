@@ -13,9 +13,8 @@
 // 响应体形态保持 {"error": code} 单键：Go 用 map[string]string，多一个字段
 // 就是 wire 契约变更，前端与人工排查都在读它。
 //
-// 异常路径（handlers 内抛出、index 层统一转 Response）走 ApiException，
-// 它的 status 由抛出点给定，但错误体形态同样收在本模块的 toResponse 里，
-// 不留给装配层手拼 JSON。
+// 异常式错误（ApiException）的 status 由抛出点给定，但错误体形态同样收在本模块的
+// toResponse 里，不留给装配层手拼 JSON。**当前生产代码无抛出点**，见下方类注释。
 
 // 错误码字面值表：对外 wire 契约的一部分，取值不可随意改。
 export const ERR_CODES = {
@@ -82,11 +81,15 @@ export function writeError(code: string, headers?: Record<string, string>): Resp
   return writeJSON(ERR_STATUS[code] ?? 500, { error: code }, headers);
 }
 
-// ApiException 是 handlers 抛出的错误载体：status 决定响应码、code 决定
-// 响应体、headers 承载 Allow / Retry-After 这类随错误码变化的头。
-// 抛出点已知道自己的地位（参数校验失败是 400、限流是 429），所以这里收 status；
-// 转成 Response 的动作收在 toResponse 里，index 层只写 catch -> toResponse，
-// 不手拼 JSON、不重新查表——错误体形态仍由本模块独占。
+// ApiException 是异常式错误载体：status 决定响应码、code 决定响应体、headers
+// 承载 Allow / Retry-After 这类随错误码变化的头。抛出点已知道自己的地位
+// （参数校验失败是 400、限流是 429），所以这里收 status；转成 Response 的动作
+// 收在 toResponse 里，装配层只写 catch -> toResponse，不手拼 JSON、不重新查表。
+//
+// **当前生产代码没有抛它的地方**：三条公共 handler 与管理端全部直接 return
+// Response。这是预留通道，装配层（index.ts 的 asResponse）保留了对它的收窄分支，
+// 使将来新增抛出点时不必同时改装配层。测试直接构造它来锁形态，因此它不是死代码，
+// 但也别把它读成「线上有异常路径在用」。
 //
 // message 取错误码本身：日志里看到 ApiException 就带着码，不必再读自定义字段。
 export class ApiException extends Error {

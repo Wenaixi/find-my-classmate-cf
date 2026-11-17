@@ -103,8 +103,24 @@ jobs:
           # 名单的结构校验与加载契约由 src/shared/roster.test.ts 与
           # src/worker/rosterStore.test.ts 以合成 fixture 覆盖，在 frontend job 里已跑。
           # 真实名单形态另由上传脚本的 --self-test 与校内部署时的实测把关。
+          #
+          # 注意这条守卫只查**文件名**。它拦不住「真实姓名被写成源码字面量」那种泄漏
+          # （曾经真的发生过：4 个在校生姓名进了 fixture）。字面量泄漏由下面那条
+          # check-roster-leak 步骤覆盖，但它在 CI 里恒无 data 可比对——仓库侧的防线
+          # 是 fixture 只用合成名白名单，见 upload-roster.mjs 的 --self-test。
           if ls data/*.json >/dev/null 2>&1; then
             echo "错误：data/ 目录包含名单数据文件，真实名单不得随仓库分发（隐私红线）。" >&2
             exit 1
           fi
           echo "零数据守卫通过：仓库无名单数据文件；名单加载契约由 TS 侧测试覆盖。"
+
+      # 比较器自测：验证「真实姓名 vs 追踪文件」的比对逻辑本身能抓差异。
+      # 没有这一步，「零命中」无法区分「真的干净」与「比较器失效」——这与既有变异
+      # 纪律同一条道理。CI 里没有 data/，所以只跑自测，不跑真实比对。
+      - name: 泄漏扫描比较器自测
+        run: node scripts/check-roster-leak.mjs --self-test
+
+      # 有 data/ 时才生效（本地与校内环境）。CI 恒无 data，此步会打印「跳过」并
+      # 退出 0——那是「这次没查」，不是「查过没问题」，输出里写明了这一区别。
+      - name: 真实姓名泄漏扫描（有 data/ 时生效）
+        run: node scripts/check-roster-leak.mjs
