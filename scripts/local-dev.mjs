@@ -77,6 +77,12 @@ function buildCases() {
     // 契约端点与错误路径
     { label: "学校列表 /api/schools", path: "/api/schools" },
     { label: "未知路径 /api/nope", path: "/api/nope" },
+    // 裸 /api 是已知差异：Go 的 ServeMux 自动 307 到 /api/，Worker 的路径判定
+    // 直接落到兜底 404 且不带 body。入表的目的是把这条口头认知变成差异表里的
+    // 一行，删 Go 之前必须由人来决定「要不要跟从 Go 的自动补斜杠」。
+    // /api/ 带斜杠的版本两侧一致（都是 404 not_found），一并入表防回归。
+    { label: "裸路径 /api", path: "/api" },
+    { label: "路径 /api/", path: "/api/" },
     { label: "方法 POST /api/search", method: "POST", path: "/api/search" },
   ];
 }
@@ -128,7 +134,10 @@ async function request(port, item) {
       method: item.method ?? "GET",
       // 超时用 AbortSignal：fetch 默认没有超时，服务半死时脚本会一直挂着。
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      // 不复用连接缓存，也不发凭证：每次请求都是同一个匿名客户端。
+      // redirect: "manual" 是刻意的：不跟随重定向，把真实的 3xx 原样拿来比较。
+      // 两端的重定向行为本身就是 wire 契约的一部分（实测 Go 对裸路径 /api 答
+      // 307 -> /api/，Worker 答 404），跟随之后这条差异会被自动吞掉，
+      // 比较器只会看到两个 404。
       redirect: "manual",
     });
   } catch (error) {
@@ -278,6 +287,57 @@ function isHealthEnvelope(res) {
   return typeof res.json?.status === "string";
 }
 
+// probeVerdict 判定一次探活的结果，是探活路径上唯一的判据 owner。
+//
+// 抽成纯函数是为了能被 --self-test 直接覆盖：探活的三条分支（连不上、
+// 被限流、不是本服务）此前只长在 main 里，自测碰不到，于是 429 那条写错过
+// 一次却没有任何用例能发现。
+//
+// 三条分支必须分开报，因为处置动作完全不同：
+//
+//   unreachable  连不上 → 服务没起来，去启动它。
+//   rate-limited 429 → 服务在跑、但桶已被前几轮打满，等一分钟再跑。
+//                 这条**不能**落进「不是本服务」：429 的响应体是
+//                 {"error":"rate_limited"}，没有 status 字段，若只靠
+//                 isHealthEnvelope 判定就会掉进 fail 分支，把用户引向
+//                 「查端口占用」这个完全错误的方向。classify 早已把 429
+//                 单独归到 env，探活路径复用同一认知即可。
+//   not-service  有响应、不是 429、也不是健康体 → 端口填错或别的服务占着。
+//
+// 返回 { ok, kind, message }；ok 为 true 时 message 是就绪描述。
+function probeVerdict(name, port, probe) {
+  if (!probe.connected) {
+    return { ok: false, kind: "unreachable", message: `${name} 服务未启动（${baseUrl(port)}，${probe.reason}）` };
+  }
+  if (probe.status === 429) {
+    return {
+      ok: false,
+      kind: "rate-limited",
+      message: `${name} 被限流（60 请求/60 秒），等一分钟再跑（${baseUrl(port)}）`,
+    };
+  }
+  if (!isHealthEnvelope(probe)) {
+    return {
+      ok: false,
+      kind: "not-service",
+      message:
+        `${name} 端口 ${port} 上不是本服务（/api/health 答的不是 JSON 健康体，` +
+        `实际为 ${describe(probe.contentType || probe.text)}）`,
+    };
+  }
+  return {
+    ok: true,
+    kind: "ready",
+    message: `${name} 服务就绪：${baseUrl(port)}（/api/health ${probe.status} ${probe.json?.status}）`,
+  };
+}
+
+// countByKind 数某一类差异项有多少条。抽出来是因为汇总行与两条提示各用一次，
+// 三处各写一遍 reduce 会让「类别键名」散在三个地方。
+function countByKind(rows, kind) {
+  return rows.filter((row) => row.kind === kind).length;
+}
+
 // padRight 按显示宽度补齐（中文按一个字符宽度算即可，差异表只求不挤在一起）。
 function padRight(text, width) {
   const value = String(text);
@@ -304,11 +364,12 @@ function printDiffTable(rows) {
   }
 }
 
-// runSelfTest 是不联网的自测：用构造的响应验证比较逻辑本身。
+// runSelfTest 是不联网的自测：用构造的响应验证比较逻辑与探活判据本身。
 //
 // 为什么必须有它：对拍脚本的价值全在「差异能被抓出来」，而一段永远返回
-// 「一致」的比较器看起来和对拍成功一模一样。这里用 6 组构造数据把每种
-// 差异形态都踩一遍，逻辑退化会立刻在这里失败，而不必依赖两个服务都活着。
+// 「一致」的比较器看起来和对拍成功一模一样。下面的用例把每种差异形态、
+// 以及探活的三条分支各踩一遍，逻辑退化会立刻在这里失败，而不必依赖两个
+// 服务都活着。
 function runSelfTest() {
   const ok = (body) => ({
     connected: true,
@@ -399,6 +460,46 @@ function runSelfTest() {
     assert.equal(diffs[0].kind, "behavior");
   });
 
+  // 以下三条守探活判据（probeVerdict）。这是修复轮 1 补的回归：
+  // 探活分支此前只长在 main 里，自测碰不到，429 那条因此写错过——
+  // 429 响应体是 {"error":"rate_limited"}，没有 status 字段，
+  // 只靠 isHealthEnvelope 会把它当成「端口上不是本服务」，
+  // 把用户引向查端口占用这个完全错误的方向。
+
+  check("探活：429 识别为被限流，不是「不是本服务」", () => {
+    const verdict = probeVerdict("Worker", 8787, err(429, "rate_limited"));
+    assert.equal(verdict.ok, false);
+    assert.equal(verdict.kind, "rate-limited");
+    // 文案必须提限流与等待，不得出现「不是本服务」这种误导性措辞。
+    assert(verdict.message.includes("限流"));
+    assert(!verdict.message.includes("不是本服务"));
+  });
+
+  check("探活：答 HTML 的端口判为「不是本服务」", () => {
+    const verdict = probeVerdict("Worker", 9999, {
+      connected: true,
+      status: 200,
+      contentType: "text/html",
+      text: "<!doctype html>",
+      json: null,
+    });
+    assert.equal(verdict.kind, "not-service");
+    assert(verdict.message.includes("不是本服务"));
+  });
+
+  check("探活：降级体 503 仍算就绪（数据缺失不该中止对拍）", () => {
+    const degraded = {
+      connected: true,
+      status: 503,
+      contentType: JSON_CONTENT_TYPE,
+      text: JSON.stringify({ status: "degraded", reason: "data" }),
+      json: { status: "degraded", reason: "data" },
+    };
+    const verdict = probeVerdict("Worker", 8787, degraded);
+    assert.equal(verdict.ok, true);
+    assert.equal(verdict.kind, "ready");
+  });
+
   if (failures > 0) {
     console.log(`自测失败 ${failures} 项`);
     process.exit(1);
@@ -420,31 +521,25 @@ async function main() {
     { name: "Worker", port: args.workerPort },
   ];
 
-  // 连通性探针：/api/health 只要收到本服务的响应就算活着（Worker 在 KV 空时答
-  // 503，那也是「活着但说明数据缺失」，必须继续对拍而不是当成没起来）。
-  //
-  // 但「有响应」不够：端口填错时本机常有别的 web 服务在答页面，只判有响应就会
-  // 把它当成对拍目标，然后刷出一屏 26 条「content-type 不同」的假差异。因此
-  // 探针还要求响应是 JSON 且带 status 字段——本服务 health 的唯一形态。
+  // 连通性探针：判据唯一 owner 是 probeVerdict（三条分支见其注释）。
+  // 这里只负责打印与收集失败。
   const down = [];
   for (const side of sides) {
     const probe = await request(side.port, { path: "/api/health" });
-    if (!probe.connected) {
-      down.push(`${side.name} 服务未启动（${baseUrl(side.port)}，${probe.reason}）`);
-      continue;
+    const verdict = probeVerdict(side.name, side.port, probe);
+    if (verdict.ok) {
+      console.log(verdict.message);
+    } else {
+      down.push(verdict);
     }
-    if (!isHealthEnvelope(probe)) {
-      down.push(
-        `${side.name} 端口 ${side.port} 上不是本服务（/api/health 答的不是 JSON 健康体，` +
-          `实际为 ${describe(probe.contentType || probe.text)}）`,
-      );
-      continue;
-    }
-    console.log(`${side.name} 服务就绪：${baseUrl(side.port)}（/api/health ${probe.status} ${probe.json?.status}）`);
   }
   if (down.length > 0) {
-    for (const line of down) console.log(line);
-    console.log("对拍中止：两侧都必须在跑（Go：go run .；Worker：npx wrangler dev --port 8787）");
+    for (const verdict of down) console.log(verdict.message);
+    // 限流是「等一等就好」，不是「去启动服务」，提示必须分开写。
+    const hint = down.every((verdict) => verdict.kind === "rate-limited")
+      ? "对拍中止：一侧被限流，等一分钟再跑。"
+      : "对拍中止：两侧都必须在跑（Go：go run .；Worker：npx wrangler dev --port 8787）";
+    console.log(hint);
     process.exit(2);
   }
 
@@ -478,31 +573,40 @@ async function main() {
     }
   }
 
-  if (connectionLost) process.exit(2);
-
+  // 差异表必须先打印，再判断掉线。脚本的全部产出就是这张表：若把它排在
+  // process.exit(2) 之后，中途掉线会把前面已经抓到的真实差异整段丢掉，
+  // 只剩一句「服务未启动」——用环境问题覆盖已发现的证据，是把验证做废。
+  // 退出码仍是 2（环境问题成立），但证据先落地。
   console.log("");
+  const diffQueries = new Set(rows.map((row) => row.label)).size;
   if (rows.length > 0) {
-    console.log(`差异表（共 ${rows.length} 条差异，涉及查询见下表）`);
+    // 量纲分开写：差异查询数 与 差异项数 不是同一个数（一条查询可出多个字段差异），
+    // 并排打印会得到「20 ≠ 0+136+0」的算术外观。
+    console.log(
+      `差异表：有差异查询 ${diffQueries} 条 / 差异项 ${rows.length} 项` +
+        `（行为 ${countByKind(rows, "behavior")} / 数据缺失 ${countByKind(rows, "data-missing")} / 环境 ${countByKind(rows, "env")}）`,
+    );
     printDiffTable(rows);
     console.log("");
   }
 
-  const byKind = { behavior: 0, "data-missing": 0, env: 0 };
-  for (const row of rows) byKind[row.kind] = (byKind[row.kind] ?? 0) + 1;
+  if (connectionLost) {
+    console.log("对拍中止：一侧服务在中途掉线，上表为掉线前已捕获的差异。");
+    process.exit(2);
+  }
 
   console.log(
-    `对拍 ${cases.length} 条查询：一致 ${identical}，有差异 ${cases.length - identical}` +
-      `（行为 ${byKind.behavior} / 数据缺失 ${byKind["data-missing"]} / 环境 ${byKind.env}）`,
+    `对拍 ${cases.length} 条查询：一致 ${identical} 条，有差异查询 ${diffQueries} 条 / 差异项 ${rows.length} 项`,
   );
 
-  if (byKind["data-missing"] > 0) {
+  if (countByKind(rows, "data-missing") > 0) {
     console.log(
       "提示：数据缺失型差异说明有一侧拿不到名单。Worker 侧本地 KV 需先灌数据" +
         "（wrangler kv key put --binding ROSTER --local --persist-to .wrangler/state），" +
         "灌完再对拍，这条差异才会消失。",
     );
   }
-  if (byKind.env > 0) {
+  if (countByKind(rows, "env") > 0) {
     console.log("提示：环境型差异说明撞到限流（60 请求/60 秒），等一分钟后再跑。");
   }
 
