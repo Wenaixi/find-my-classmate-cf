@@ -13,6 +13,7 @@ data/log/
 # 环境与密钥
 .env
 .env.*
+.dev.vars
 !.env.example
 
 # Go 构建产物
