@@ -4,9 +4,11 @@ import { gradeDomain } from "./grades";
 import contract from "../../docs/query-contract.json";
 
 // 前端只保留查询解释语义：解析查询串、判断是否含姓名条件。
-// 运行时搜索（匹配、排序、分页）唯一归属 Go 端 search.go。
-// 解析契约由 docs/query-contract.json 单一事实源定义，两侧测试各自消费；
-// Go 端是运行时唯一执行者，corpus 以 Go 行为为准，前端必须对齐。
+// 运行时搜索（匹配、排序、分页）唯一归属 src/worker/search.ts（迁移前是 Go 端
+// search.go，已随 Task 19 退役）。
+// 解析契约由 docs/query-contract.json 单一事实源定义，本文件与
+// src/worker/search.test.ts 各自消费；语料的期望值源自迁移前 Go 端实测行为，
+// 现在由 TS 实现承接，改动语料必须同时核对这两个消费方。
 
 interface ContractCase {
   raw: string;

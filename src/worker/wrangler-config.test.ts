@@ -40,6 +40,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
 const CONFIG_PATH = "wrangler.jsonc";
+const VITE_CONFIG_PATH = "vite.config.ts";
 
 // stripJSONC 把 JSONC 转成可 JSON.parse 的文本。
 //
@@ -62,6 +63,23 @@ function stripJSONC(source: string): string {
 function loadConfig(): Record<string, unknown> {
   const raw = readFileSync(CONFIG_PATH, "utf8");
   return JSON.parse(stripJSONC(raw)) as Record<string, unknown>;
+}
+
+// viteOutDir 从 vite.config.ts 抽出 build.outDir 的字面值。
+//
+// 不 import vite.config.ts：它默认导出的是 vite 的 defineConfig 结果，import 会
+// 把整个 vite 运行时与 react 插件拖进这个 node 项目，只为读一个字符串不值。
+// 也不做完整 TS 解析：本仓的 outDir 是一行字面量，正则是恰好够用的那一档。
+//
+// 正则只认这个字段名且要求值在双引号内：写成变量、反引号或单引号都会匹配
+// 失败并让用例翻红——那正是想被发现的形态（部署读的是字面目录，不是求值结果）。
+function viteOutDir(): string {
+  const source = readFileSync(VITE_CONFIG_PATH, "utf8");
+  const match = /outDir:\s*"([^"]+)"/.exec(source);
+  if (match === null) {
+    throw new Error(`${VITE_CONFIG_PATH} 里找不到形如 outDir: "..." 的字面量`);
+  }
+  return match[1];
 }
 
 // assets 字段的形状。用结构化断言而不是 any：字段名写错会编译失败。
@@ -153,8 +171,26 @@ describe("wrangler.jsonc 部署契约", () => {
 
   // 单页回退与产物目录是部署形态的一部分，写错会让页面路由拿不到首页、
   // 或让 deploy 上传一份空资产。
-  it("assets 声明了单页回退与迁移期产物目录", () => {
+  it("assets 声明了单页回退与产物目录", () => {
     expect(assets?.not_found_handling).toBe("single-page-application");
     expect(assets?.directory).toBe("./dist");
   });
+
+  // 两个文件必须指向同一个目录。
+  //
+  // 这条断言存在的原因是「断言约等于没断言」：只写上面那条
+  // assets.directory === "./dist" 时，把 vite.config.ts 的 outDir 改回别的
+  // 目录，测试全绿、deploy:dry-run 也不红（dry-run 只校验目录存在，不校验
+  // 它是不是构建产物落点），而 wrangler 会继续上传一份陈旧资产。
+  //
+  // 写法上的两个不同：vite 侧写 "dist"（相对仓库根、无 ./ 前缀），wrangler
+  // 侧写 "./dist"（wrangler 的路径字段惯例带前缀）。因此断言的是「同一个
+  // 目录」而不是「同一串字符」——把 wrangler 那侧的值去掉 ./ 前缀再比。
+  it("vite 的 build.outDir 与 assets.directory 指向同一目录", () => {
+    const directory = String(assets?.directory ?? "");
+    expect(directory, "assets.directory 缺失或为空").not.toBe("");
+    const wranglerOutDir = directory.replace(/^\.\//, "");
+    expect(viteOutDir(), `${VITE_CONFIG_PATH} 的 outDir 与 wrangler 的 assets.directory 不一致`).toBe(wranglerOutDir);
+  });
 });
+

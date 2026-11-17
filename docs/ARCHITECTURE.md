@@ -2,6 +2,14 @@
 
 > 本文件是项目的唯一架构文档，描述稳定不变的逻辑骨架与契约。实现细节会演进，本文只记录不会过期的部分。改动架构时必须同步更新本文。
 
+> **状态（Task 19 之后）：本文已部分失效。** 「总体形态」（§1）、「请求生命周期」中与后端实现相关处、
+> 「后端模块边界」（§8）、「部署与发布约定」（§9）、「启动自举与日志」（§10）、「测试策略」（§11）描述的是
+> 迁移前 Go 单二进制时代的形态：`server/`、Dockerfile、docker-compose.yml 已随 Task 19 全部删除，
+> 文中「`go run ./server`」「端口 3078」「`//go:embed all:web`」「gofmt / go test / go vet」「三平台交叉编译」
+> 「`server/web/` 产物目录」「`FMC_DATA_DIR` / `FMC_LOG_DIR`」等**均不再是可执行的操作指引，照做会失败**。
+> 现行形态以 `wrangler.jsonc`、`README.md` 的部署章节与 `docs/cloudflare-migration-design.md` 为准。
+> 本文的重写由 Task 20 承担；在此之前请勿按上述章节操作。
+
 ## 1. 总体形态
 
 单仓库、双语言、单产物：

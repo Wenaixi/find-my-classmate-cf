@@ -6,11 +6,22 @@
 // - compatibility_date 写当日。迁移期不钉旧日期：本仓没有依赖旧兼容行为的代码，
 //   钉一个更早的日期只会让 nodejs_compat 之类的默认行为退回旧形态。
 // - kv_namespaces 只声明 binding，不写 id。id 是账号内的资源标识，写死它会把
-//   「哪个账号部署」绑进仓库；wrangler 的自动供给按 name+binding 生成资源名
-//   （find-my-classmate-cf-ROSTER），首次 deploy 时创建并把 id 回写到本文件，
-//   之后有无 id 都能继续部署。本地 workerd 用 miniflare 的内存 KV 模拟，
-//   测试与本地开发都不需要它。实测：删掉 id 后 `deploy --dry-run` 通过，绑定义
+//   「哪个账号部署」绑进仓库；本地 workerd 用 miniflare 的内存 KV 模拟，测试
+//   与本地开发都不需要它。实测：删掉 id 后 `deploy --dry-run` 通过，绑定
 //   metadata 里落成 type: "inherit"。
+//
+//   自动供给的真实行为（官方文档与 changelog 2025-10-24 的措辞很关键，不要
+//   按「首次 deploy 一定回写 id」去理解）：
+//     - 本地跑 `wrangler deploy`：资源按 binding 名创建，并把 id **回写进本文件**；
+//     - 从 dashboard / GitHub Actions 部署：资源照样创建，但 id 只留在 dashboard，
+//       **不会回写仓库**。官方原话是「即便不把资源 id 加进配置文件，资源在后续
+//       部署之间仍保持关联」——所以 CI 路径不会每次都新建一个 namespace；
+//       workers-sdk 有过「Builds 下自动供给非幂等」的 issue（#14284），
+//       本机的 wrangler 4.163.0 未验证该修复是否覆盖这条路径。
+//   因此首次部署**建议在本地跑** `npx wrangler deploy`，把回写的 id 提交进仓库：
+//   那一步之后 id 就是仓库里的显式事实，CI 与本地都读同一份，不依赖自动供给的
+//   跨部署关联行为。若首次就走 CI，也能跑通（同上「仍保持关联」），但仓库里
+//   永远不会出现 id，排查「绑定指向哪个 namespace」时只能去 dashboard 看。
 // - ratelimits 的 namespace_id 是账号内唯一的整数标识，取值 1001 是固定的
 //   「这个 binding 占哪个命名空间」声明，不需要与任何远端资源对应，因此可以
 //   直接进仓库（与 KV 的 id 不同：KV id 指向一个已创建的资源，rate limit

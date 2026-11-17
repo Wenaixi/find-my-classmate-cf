@@ -39,11 +39,12 @@ export const gradeDomain: { values: typeof gradeValues; aliases: typeof gradeAli
 // 报错形态刻意带出缺失项本身（缺「高四」时该类型退化为 { missing: "高四" }），
 // 而不是让 Exclude 直接得 never 后报一条无从解读的 never 不兼容。
 //
-// 检查必须落在非测试文件：.dockerignore 排除 src/**/*.test.ts，
-// 放进测试文件则容器镜像构建的 tsc -b 不再检查它，会造出一条「本地绿、
-// 镜像不查」的隐形防线。gradeDomainExhaustive 在生产代码中无人消费，
-// tsc 不报错（tsconfig.app.json 未开 noUnusedLocals，全仓无 eslint 配置与
-// lint 脚本）。
+// 检查必须落在非测试文件：tsconfig.app.json 的 include 是 ["src"]，测试文件
+// 本来就在类型检查范围内，但把这条约束放进测试文件会让它依赖「测试文件恰好
+// 被 tsc 检查」这个巧合——挪动 exclude 或换一个编译项目，它就静默失效了。
+// 放在生产代码里则是硬约束：任何人编译本仓都必然读到它。
+// gradeDomainExhaustive 在生产代码中无人消费，tsc 不报错（tsconfig.app.json
+// 未开 noUnusedLocals，全仓无 eslint 配置与 lint 脚本）。
 type GradeDomainGap = Exclude<Grade, (typeof gradeValues)[number]>;
 const gradeDomainExhaustive: GradeDomainGap extends never ? true : { missing: GradeDomainGap } = true;
 void gradeDomainExhaustive;

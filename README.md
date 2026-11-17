@@ -63,12 +63,19 @@ npx wrangler login
 npx wrangler secret put ADMIN_TOKEN
 ```
 
-`wrangler.jsonc` 里的 `kv_namespaces` 只声明 binding 名 `ROSTER`、不写 id：首次 `deploy` 时 wrangler 会按名字自动创建命名空间并把 id 回写到该文件。
+`wrangler.jsonc` 里的 `kv_namespaces` 只声明 binding 名 `ROSTER`、不写 id——id 是账号内的资源标识，写死会把「哪个账号部署」绑进仓库。
+
+首次部署**在本地跑** `npx wrangler deploy`，wrangler 会按 binding 名创建 KV namespace 并把 `id` 回写进 `wrangler.jsonc`，**把那一行 id 提交进仓库**。这样之后 CI 与本地读的是同一份显式事实。
+
+若首次部署走 GitHub Actions 也可以跑通：资源同样会被创建，但 id 只出现在 dashboard，不会回写仓库，仓库里永远不会出现 id。官方文档的说法是「即便不把资源 id 加进配置文件，资源在后续部署之间仍保持关联」，所以不会每次新建 namespace；但 workers-sdk 有过「Builds 下自动供给非幂等」的 issue（#14284），本机 wrangler 4.163.0 是否已修复未验证。因此本地首发是更稳的那条路，也让「绑定指向哪个 namespace」在仓库里可查。
 
 ### 部署与灌名单
 
 ```bash
-# 上线（生产）
+# 首发：在本地跑一次，把回写的 KV id 提交进仓库（见上）
+npx wrangler deploy
+
+# 之后日常上线：本地或打 tag 让 deploy.yml 跑，两条路等价
 npx wrangler deploy
 
 # 线上名单：管理 API 上传，一校一 PUT，写入后全站生效
