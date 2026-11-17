@@ -26,7 +26,8 @@
 // 错误淹没在一屏重复失败里。
 
 import assert from "node:assert/strict";
-import { readFile, readdir } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { readFile, readdir, stat } from "node:fs/promises";
 import path from "node:path";
 
 // 命中的文件名后缀。与上游导出脚本的产物命名一致（校名_人数_roster.json）。
@@ -64,6 +65,11 @@ function normalizeEndpoint(raw) {
 // 校名是自由文本（含中文、空格，理论上也可能含 / ? # &），其中 / 会直接切开
 // 路径、? 与 # 会截断或改写 URL，& 会污染查询串。服务端用 decodeURIComponent
 // 还原路径段（src/worker/admin.ts 的 decodeSchool），两端因此严格互逆。
+//
+// 校名含孤立代理项（如 "\uD800"，露骨的 U+FFFD 替换字符或某些导出工具的坏数据）
+// 时 encodeURIComponent 抛 URIError: URI malformed。这个抛错存在，调用点就必须
+// 自己兜住——见 uploadOne：拼接在 try 内，URIError 与网络失败同路收敛成结论对象，
+// 否则它会绕过 classifyResponse 与汇总契约，让整轮崩掉且一行汇总都不打印。
 function buildRosterUrl(endpoint, schoolName) {
   return `${endpoint}/api/admin/roster/${encodeURIComponent(schoolName)}`;
 }
@@ -76,8 +82,11 @@ function buildRosterUrl(endpoint, schoolName) {
 // 顶层先做形态检查再拆分：这份文件不是 roster 时，报错必须点名文件与原因，
 // 否则运维只会看到「上传了 0 所学校」这种无信息量的结果。检查口径与
 // src/shared/roster.ts 的阶段一同源（顶层是对象、学校 是数组），但这里只做
-// 「能不能拆」的最小判定——内容合法性（年级/班级/姓名、重复校名）是服务端
-// 校验层的职责，脚本复刻一遍只会得到第二份会漂移的规则。
+// 「能不能拆」的最小判定——内容合法性（年级/班级/姓名）是服务端校验层的职责，
+// 脚本复刻一遍只会得到第二份会漂移的规则。
+//
+// 重名校不在这里判：它要跨文件看（同一校名可能出现在两个不同文件名里），
+// 单一文件的视野不够。那条判定归 run 里的 checkSchoolNameConflict。
 function extractSchoolDocuments(document, sourceLabel) {
   if (document === null || typeof document !== "object" || Array.isArray(document)) {
     throw new Error(`${sourceLabel} 顶层不是对象，不是 roster 格式`);
@@ -178,20 +187,46 @@ function stripBom(text) {
 
 // listRosterFiles 列出待上传的文件名（只留后缀匹配的），并按名字排序。
 // 排序是为了让每轮输出顺序一致：同一批文件重复跑时，日志能逐行对照。
+//
+// 符号链接要单独判：`entry.isFile()` 对 symlink 恒为 false（readdir 报的是
+// 链接自身而不是目标），于是「运维用 symlink 把名单挂进 data/」会被报成
+// 「没有 roster 文件」并 exit 2。跟着链接 stat 一次，按目标的真实类型判定。
+// 链接指向断链或目录时跳过——那两种情况读文件必然失败，让它在读取阶段报
+// 具体原因，比在这里静默过滤更好。
 async function listRosterFiles(dir) {
   const entries = await readdir(dir, { withFileTypes: true });
-  return entries
-    .filter((entry) => entry.isFile() && entry.name.endsWith(ROSTER_FILE_SUFFIX))
-    .map((entry) => entry.name)
-    .sort((a, b) => a.localeCompare(b, "zh-Hans-CN"));
+  const candidates = entries.filter((entry) => entry.name.endsWith(ROSTER_FILE_SUFFIX));
+
+  const files = [];
+  for (const entry of candidates) {
+    if (entry.isFile()) {
+      files.push(entry.name);
+      continue;
+    }
+    if (entry.isSymbolicLink()) {
+      try {
+        if ((await stat(path.join(dir, entry.name))).isFile()) files.push(entry.name);
+      } catch {
+        // 断链：跳过。它读不了，列出来只会给运维一个更远的位置去查。
+      }
+    }
+  }
+  return files.sort((a, b) => a.localeCompare(b, "zh-Hans-CN"));
 }
 
-// uploadOne 发一次 PUT 并归类。网络层失败（连不上、超时、DNS）同样收敛成一个
-// 结论对象，让调用点只有一条分支要看——但它与 HTTP 失败分开标记（kind 为
-// network），因为「服务没起来」与「服务拒了这份名单」的处置完全不同。
+// uploadOne 发一次 PUT 并归类。
+//
+// 网络层失败（连不上、超时、DNS）同样收敛成一个结论对象，让调用点只有一条分支
+// 要看——但它与 HTTP 失败分开标记（kind 为 network），因为「服务没起来」与
+// 「服务拒了这份名单」的处置完全不同。
+//
+// URL 拼接必须在 try 内：encodeURIComponent 对含孤立代理项的校名抛 URIError，
+// 这个异常若逃出去就绕过了 classifyResponse 与汇总契约——整轮崩掉、后续一次
+// PUT 都不发、连汇总行都不会打印。移进 try 后它落进下面的 catch，被收敛成一条
+// 逐校失败（kind 为 invalid-name），其余学校照常上传。
 async function uploadOne(endpoint, token, schoolName, payload) {
-  const url = buildRosterUrl(endpoint, schoolName);
   try {
+    const url = buildRosterUrl(endpoint, schoolName);
     const response = await fetch(url, {
       method: "PUT",
       headers: {
@@ -204,11 +239,21 @@ async function uploadOne(endpoint, token, schoolName, payload) {
     const text = await response.text();
     return { ...classifyResponse(response.status, text), url };
   } catch (error) {
+    // 校名无法编码是这一所学校的请求问题，不是链路问题：它不该中止整轮，
+    // 也不该被说成「请求无法到达服务」。单独成类，逐校继续。
+    if (error instanceof URIError) {
+      return {
+        ok: false,
+        kind: "invalid-name",
+        detail: `校名无法编码进 URL（${error.name}: ${error.message}）；该名含孤立代理项或不完整字符，请修正源文件`,
+        url: null,
+      };
+    }
     // fetch 的网络失败只有一句 "fetch failed"，真因（ECONNREFUSED、ENOTFOUND、
     // 超时）藏在 cause 里。不取 cause 的话「端口没开」与「代理把请求吞了」
     // 在日志上长得一模一样。
     const reason = describeFetchError(error);
-    return { ok: false, kind: "network", detail: `请求失败：${reason}`, url };
+    return { ok: false, kind: "network", detail: `请求失败：${reason}`, url: null };
   }
 }
 
@@ -236,9 +281,63 @@ function printResult(schoolName, sourceFile, verdict) {
   console.log(`[失败] ${schoolName}（来源 ${sourceFile}）：${verdict.detail}`);
 }
 
+// fingerprint 是内容比对用的短哈希。用它而不是比全文：名单动辄几百 KB，
+// 逐字比较要留两份全文在内存里；而这里只需要回答「两次出现是不是同一份内容」。
+//
+// 用 node:crypto 的 sha256 而不是手写摘要：摘要算法不该自己发明。截到 64 位
+// （16 位十六进制）是够用的：它只用来区分同一目录里人工导出的几份名单，
+// 不是抗碰撞的完整性校验。真要一个刻意的伪碰撞输入，后果也只是「不同内容被
+// 当成幂等重传」——而这两份文件本身仍然各自合法，服务端行为与现在一致。
+const FINGERPRINT_LENGTH = 16;
+
+function fingerprint(payload) {
+  return createHash("sha256").update(payload, "utf8").digest("hex").slice(0, FINGERPRINT_LENGTH);
+}
+
+// checkSchoolNameConflict 判定「这次要上传的学校」是不是与之前某一份重名。
+//
+// 为什么必须拦：真实目录里的文件名是 校名_人数_roster.json，同一所学校不同人数
+// 会得到两个不同的文件名，两个都匹配 *_roster.json、都会被上传。服务端 putRoster
+// 是覆盖语义，两次都 201 —— 后一份静默覆盖前一份，而脚本打印全绿、exit 0。
+// 运维看到「全部成功」，KV 里却是被覆盖后的某一版：少了一整校或存的是旧名单，
+// 且没有任何信号。这条路径是「全绿但数据错」，比报错更难发现。
+//
+// 三种结论：
+//   null     从未见过这个名字 → 正常上传。
+//   "same"   重名且内容逐字节相同 → 幂等重传，照常上传，不改变任何状态。
+//   "differ" 重名但内容不同 → 后一份会覆盖前一份，必须报错并计入 failures。
+//
+// 用内容指纹而不是「谁说重复」的计数：同一份文件重跑一遍是幂等（"same"），
+// 而改了内容再跑（"differ"）会变成可见的失败，两者因此不会互相冒充。
+//
+// seen 由调用点持有，形状是 Map<校名, { file, fingerprint }>；本函数只读它、
+// 不改它——写入发生在调用点判定之后，避免「判定失败却已登记」的残留。
+function checkSchoolNameConflict(seen, schoolName, payload) {
+  const previous = seen.get(schoolName);
+  if (previous === undefined) return null;
+  return fingerprint(payload) === previous.fingerprint ? "same" : "differ";
+}
+
+// printConflict 打印重名冲突。措辞要能让运维一眼看出「后一份会覆盖前一份、
+// 所以本次没传」，而不是「重复上传所以跳过」——后者会让人以为没传。
+//
+// 两只指纹都打出来：运维据此把两份文件拿去对比，判断该留哪一份。
+// 当前内容作为入参传入而不是让函数自己从 previous 里取，保证打印的指纹与
+// 判定用的指纹同源。
+function printConflict(schoolName, currentFile, currentPayload, previous) {
+  console.log(
+    `[冲突] ${schoolName}：已在 ${previous.file} 上传过（指纹 ${previous.fingerprint}），` +
+      `本次来自 ${currentFile}（指纹 ${fingerprint(currentPayload)}）内容不同——` +
+      `服务端是覆盖语义，后一份会覆盖前一份，本次未上传；请确认哪一份是最终版`,
+  );
+}
+
 // run 是整轮上传的主体：逐文件读、拆、逐校上传，401 与网络故障时中止。
 async function run(args) {
   const summary = { schools: 0, successes: 0, failures: 0, files: 0, aborted: false, remaining: 0 };
+
+  // 校名 → 已上传的 { file, fingerprint, payload }。整轮共享，用来识别跨文件重名。
+  const seen = new Map();
 
   let files;
   try {
@@ -274,9 +373,24 @@ async function run(args) {
 
     for (const [index, document] of documents.entries()) {
       summary.schools += 1;
+
+      // 重名判定先于上传：不先判的话后一份已经把前一份覆盖了，再来报错也晚了。
+      // "differ" 计入 failures（→ exit 1）但不发 PUT：让运维先决定哪一份是最终版，
+      // 比脚本自己挑一份覆盖下去更安全。错误数据一旦落进 KV，服务端下次加载就会
+      // 拿它服务，而现场（哪次上传、谁传的）已经丢了。
+      const conflict = checkSchoolNameConflict(seen, document.schoolName, document.payload);
+      if (conflict === "differ") {
+        summary.failures += 1;
+        printConflict(document.schoolName, fileName, document.payload, seen.get(document.schoolName));
+        continue;
+      }
+
       const verdict = await uploadOne(args.endpoint, args.token, document.schoolName, document.payload);
       if (verdict.ok) {
         summary.successes += 1;
+        // 只有真的成功才登记：失败的那一份没有写进 KV，不该让后续同名项被它
+        // 判定成「重名」。登记的是本次内容指纹，后续同内容的再次出现算幂等重传。
+        seen.set(document.schoolName, { file: fileName, fingerprint: fingerprint(document.payload) });
       } else {
         summary.failures += 1;
       }
@@ -301,15 +415,20 @@ async function run(args) {
   return summary;
 }
 
-// runSelfTest 覆盖全部纯逻辑：拆分、URL 编码、响应归类、退出码、参数与文件形态。
-// 不联网、不用真实 data/，因此能在任何机器上跑（包括 CI）。
-function runSelfTest() {
+// runSelfTest 覆盖全部纯逻辑：拆分、URL 编码、响应归类、退出码、参数、文件形态、
+// 跨文件同名校冲突、校名不可编码。不联网、不用真实 data/，因此能在任何机器上跑
+// （包括 CI）。
+async function runSelfTest() {
   const roster = (region, schools) => JSON.stringify({ 区县: region, 学校: schools });
   let failures = 0;
+
+  // pending 收集每条用例的返回值。同步用例在这里就已得出结果，async 用例留一个
+  // promise 待末尾统一 await——同步 try/catch 抓不住 async 的 rejection，
+  // 不这么做那条 URIError 用例会「永远通过」，测的是空气。
+  const pending = [];
   const check = (label, fn) => {
     try {
-      fn();
-      console.log(`自测通过：${label}`);
+      pending.push({ label, result: fn() });
     } catch (error) {
       failures += 1;
       console.log(`自测失败：${label} -> ${error.message}`);
@@ -438,10 +557,61 @@ function runSelfTest() {
     assert.equal(stripBom("{}"), "{}");
   });
 
+  check("跨文件同名校：同内容算幂等重传，不算冲突", () => {
+    const seen = new Map();
+    const payload = JSON.stringify({ 区县: "福清市", 学校: [schoolA] });
+    assert.equal(checkSchoolNameConflict(seen, "福清一中", payload), null);
+    // 模拟第一份已成功登记（指纹同源，都由 fingerprint 算）。
+    seen.set("福清一中", { file: "福清一中_173_roster.json", fingerprint: fingerprint(payload) });
+    assert.equal(checkSchoolNameConflict(seen, "福清一中", payload), "same");
+  });
+
+  check("跨文件同名校：不同内容判为冲突（后一份会覆盖前一份）", () => {
+    const seen = new Map();
+    const first = JSON.stringify({ 区县: "福清市", 学校: [schoolA] });
+    const second = JSON.stringify({ 区县: "福清市", 学校: [{ ...schoolA, 年级: [] }] });
+    seen.set("福清一中", { file: "福清一中_173_roster.json", fingerprint: fingerprint(first) });
+    assert.equal(checkSchoolNameConflict(seen, "福清一中", second), "differ");
+    // 换一所学校不受影响：判定按校名分桶，不是全局「见过任何名单」。
+    assert.equal(checkSchoolNameConflict(seen, "福清二中", second), null);
+  });
+
+  check("冲突计入 failures 并让退出码非 0（不发 PUT 也不改变汇总口径）", () => {
+    assert.equal(exitCodeFor({ failures: 1, aborted: false }), EXIT_FAILED);
+    // 只有成功项（幂等重传）时退出码仍是 0：重复跑同一批文件不该被当成失败。
+    assert.equal(exitCodeFor({ failures: 0, aborted: false }), EXIT_OK);
+  });
+
+  check("校名含孤立代理项时 URIError 被 uploadOne 收敛成结论对象", async () => {
+    // 直接调用即可：buildRosterUrl 在 try 内，抛错落进 catch。
+    const badName = "坏\uD800校";
+    // 先证明这个输入确实会触发 URIError，否则下面的断言测的是空气。
+    assert.throws(() => encodeURIComponent(badName), URIError);
+
+    const verdict = await uploadOne("http://127.0.0.1:8787", "t", badName, "{}");
+    assert.equal(verdict.ok, false);
+    assert.equal(verdict.kind, "invalid-name");
+    assert(verdict.detail.includes("校名无法编码进 URL"));
+    // 它既不该被说成网络故障，也不该中止整轮。
+    assert.notEqual(verdict.kind, "network");
+  });
+
+  // 统一收口：同步用例这里才打印结论，async 用例先 await 再判定。
+  // 顺序按登记顺序，日志因此与代码顺序一致，逐条核对时不会错位。
+  for (const item of pending) {
+    try {
+      await item.result;
+      console.log(`自测通过：${item.label}`);
+    } catch (error) {
+      failures += 1;
+      console.log(`自测失败：${item.label} -> ${error.message}`);
+    }
+  }
+
   if (failures > 0) {
     throw new Error(`${failures} 条自测失败`);
   }
-  console.log("自测全部通过");
+  console.log(`自测全部通过（${pending.length} 条）`);
 }
 
 // main 是进程入口：自测只跑纯逻辑，正常模式跑整轮上传，最后统一翻译成退出码。
@@ -455,7 +625,7 @@ async function main() {
   }
   if (args.selfTest) {
     try {
-      runSelfTest();
+      await runSelfTest();
       return EXIT_OK;
     } catch (error) {
       console.log(error instanceof Error ? error.message : String(error));
@@ -466,11 +636,12 @@ async function main() {
   const summary = await run(args);
   if (summary.usageError) return EXIT_USAGE;
 
-  // 「成功 + 失败」不等于「总学校数」只在中止时成立——中止后剩下的学校从未尝试，
-  // 单列出来而不是混进失败数，否则一条 token 错误会看起来像「几十所学校内容都不合法」。
+  // 「已尝试」而不是「已上传」：summary.schools 在发 PUT 之前自增，重名冲突项
+  // 与失败项都算进去，实际写进 KV 的数量是 summary.successes。两处用词必须分开，
+  // 否则一行汇总会把「试了 3 所、只成功 1 所」说成「上传了 3 所」。
   const unattempted = summary.aborted ? `（未尝试 ${summary.remaining} 项：本文件剩余学校 + 后续未处理文件）` : "";
   console.log(
-    `汇总：文件 ${summary.files} 个，已上传学校 ${summary.schools} 所；成功 ${summary.successes}，失败 ${summary.failures}${unattempted}`,
+    `汇总：文件 ${summary.files} 个，已尝试学校 ${summary.schools} 所；成功 ${summary.successes}，失败 ${summary.failures}${unattempted}`,
   );
   return exitCodeFor(summary);
 }
