@@ -72,10 +72,8 @@ npx wrangler secret put ADMIN_TOKEN
 ### 部署与灌名单
 
 ```bash
-# 首发：在本地跑一次，把回写的 KV id 提交进仓库（见上）
-npx wrangler deploy
-
-# 之后日常上线：本地或打 tag 让 deploy.yml 跑，两条路等价
+# 上线：首发在本地跑一次（把回写的 KV id 提交进仓库，见上），之后本地或打 tag
+# 让 deploy.yml 跑，两条路等价——命令都是这一条
 npx wrangler deploy
 
 # 线上名单：管理 API 上传，一校一 PUT，写入后全站生效

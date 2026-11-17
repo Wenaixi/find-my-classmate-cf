@@ -2,13 +2,46 @@
 
 > 本文件是项目的唯一架构文档，描述稳定不变的逻辑骨架与契约。实现细节会演进，本文只记录不会过期的部分。改动架构时必须同步更新本文。
 
-> **状态（Task 19 之后）：本文已部分失效。** 「总体形态」（§1）、「请求生命周期」中与后端实现相关处、
-> 「后端模块边界」（§8）、「部署与发布约定」（§9）、「启动自举与日志」（§10）、「测试策略」（§11）描述的是
-> 迁移前 Go 单二进制时代的形态：`server/`、Dockerfile、docker-compose.yml 已随 Task 19 全部删除，
-> 文中「`go run ./server`」「端口 3078」「`//go:embed all:web`」「gofmt / go test / go vet」「三平台交叉编译」
-> 「`server/web/` 产物目录」「`FMC_DATA_DIR` / `FMC_LOG_DIR`」等**均不再是可执行的操作指引，照做会失败**。
+> **状态（Task 19 之后）：本文已部分失效。** 按关键词（`server/*.go`、`go run`、`gofmt`、`go test`、`go vet`、
+> `go build`、`go:embed`、`3078`、`FMC_DATA_DIR` / `FMC_LOG_DIR`、`Dockerfile`、`docker`、交叉编译、
+> 单二进制、`src/lib/query.*`、`knownGrades`、`TestSearchResponseKeys`、`newHandlerChain`、
+> `writeRateLimited`、`fillTokens`、「双端 / 两侧同步 / 前后端同步」）逐节扫描全文，
+> **11 个章节含照做即失败的活指令，仅 §6 前端状态机一节干净**。
+>
+> 失效章节与范围（按章节定位，不引用行号——本文自身改动会让行号漂移）：
+>
+> - **§1 总体形态**——「单仓库、双语言、单产物」整段：`//go:embed all:web`、单二进制交付物、
+>   端口 3078、`FMC_DATA_DIR` 指向数据目录，以及其后「由这个形态决定的三个不可破坏的边界」
+> - **§2 数据模型与隐私边界**——「加载时执行的规范化（`server/data.go`）」及该节对 Go 加载器的描述
+> - **§3 查询契约（前端解释 + 后端执行）**——「查询语义的**运行时执行唯一归属后端** `server/search.go`」、
+>   「`src/lib/query.ts` 的 `goSpaceChars` 是前端这两处差集的唯一修正点」、
+>   「`src/lib/query.test.ts` 与 `server/contract_test.go` 各自消费同一份语料」
+> - **§4 契约常量（双端各一份）**——整节以「后端 `server/config.go` 与前端各持一份」为前提，
+>   其中「**改动必须两侧同步**」是**可执行指令，照做会失败**（Go 侧已不存在）；同节的端口 3078、
+>   令牌桶限流参数、`server/contract_constants_test.go` 读取前端常量，均随之失效
+> - **§5 请求生命周期**——链顺序由 Go 的 `newHandlerChain` 单点定义、`writeRateLimited` /
+>   `fillTokens` 等 Go 侧符号，以及「在此之后交给后端」的数据视图与 Search 描述
+> - **§7 前端模块边界**——模块表仍列 `src/lib/query.ts`（该文件已不存在，现为 `src/shared/query.ts`）
+> - **§8 后端模块边界**——**整节作废**：12 行模块表（`main.go` / `middleware.go` / `logging.go` /
+>   `api.go` / `errors.go` / `config.go` / `data.go` / `classparse.go` / `ip.go` / `search.go` /
+>   `ratelimit.go` / `web.go`）全部已删；其后「数据热重载策略」「健康检查语义」也以这些模块为承载
+> - **§9 部署与发布约定**——`npm run build` → `go run ./server`、端口 3078、Docker 多阶段构建、
+>   frontend/backend job 与 `frontend-build` artifact 复用、gofmt / `go test -race` / `go vet`、
+>   Docker buildx 验证、tag 触发三平台交叉编译、「归档不含 `server/web`」
+> - **§10 启动自举与日志**——`FMC_LOG_DIR` 指向容器可写区、docker 收集 stdout、`logrotate` /
+>   docker json-file、日志双写与轮转策略
+> - **§11 测试策略**——「名单结构、字段白名单与去重的校验由 `server/data_test.go` 在部署环境执行」、
+>   Go 侧 go test 覆盖清单与 `TestRealRosterIsLoadable` 等用例名
+> - **§12 演进原则**——「单产物优先：新增功能优先考虑"仍是一个二进制"的形态」、「解析双端一致：
+>   解析规则改动必须前后端同步」、「执行语义单端（后端）」、「查询改动：解析规则先改测试再同步
+>   前后端」，以及 ADR-0001 里以 `TestSearchResponseKeys` / `newStudent` 为证据的论证
+>
+> 另有**跨章节的失效指针（与 Go 无关）**：全文中 `src/lib/query.ts` / `src/lib/query.test.ts` 指向的
+> 路径**已不存在**——查询解析已迁至 `src/shared/query.ts`，其测试为 `src/shared/query.test.ts`。
+> 这是 Task 1-3 迁移 shared 层时的遗留，同样属于照做会迷路的指引。
+>
 > 现行形态以 `wrangler.jsonc`、`README.md` 的部署章节与 `docs/cloudflare-migration-design.md` 为准。
-> 本文的重写由 Task 20 承担；在此之前请勿按上述章节操作。
+> 本文的重写由 Task 20 承担；在此之前**请勿按上述章节操作**。
 
 ## 1. 总体形态
 

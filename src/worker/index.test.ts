@@ -500,10 +500,53 @@ describe("未知 /api/* 与静态回退", () => {
   });
 });
 
+// fillWindow 对同一个 IP 连发 limit 次 /api/health，返回第 limit+1 次（即应被拒绝的那次）。
+//
+// 为什么要「按窗口重试」而不是直接连发 61 次：
+// wrangler.jsonc 声明的是 simple 限流（limit=60 / period=60），Workers 的 simple
+// 形态只有固定窗口，没有令牌桶那样的匀速回补。连发 61 次要断言「第 61 次一定
+// 429」，隐含了「这 61 次全部落在同一个窗口内」这个前提；若循环起点恰好落在窗口
+// 末段，窗口在循环中途翻转会把计数清零，第 61 次就被放行而不是 429——一条本应
+// 承重的断言随机翻红，且看起来像「限流坏了」。
+//
+// 处理办法：检测到窗口翻转就重来一轮（最多 maxAttempts 次）。判据是「放行次数
+// 超过 limit」——正常情形下第 limit+1 次必然被拒，只有计数被清零才会出现额外的
+// 放行。重试只在窗口边界附近发生，不会削弱断言强度：最终仍然要求「打满窗口后
+// 的下一次必须是 429（含 Retry-After、错误体、安全头）」。若限流真的失效（比如
+// 装配层给 health 开了免限流口子），每一轮都会尝试 limit+1 次全部放行，重试会
+// 耗尽并翻红。
+async function fillWindow(ip: string, limit: number, maxAttempts = 3): Promise<Response> {
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    let allowed = 0;
+    let denied: Response | undefined;
+    for (let index = 0; index < limit; index += 1) {
+      const response = await SELF.fetch(request("/api/health", undefined, ip));
+      if (response.status === 429) {
+        // 还没打满就被拒：说明这一轮起点太靠近窗口末尾（本轮之前的请求消耗了
+        // 这个 IP 的额度），或者限流比配置更严。换一轮重来。
+        denied = response;
+        break;
+      }
+      // KV 为空时健康检查答 503，这正是「放行」的证据：断言 429 之外的状态
+      // 才能确认它们真的走完了 mux。
+      expect([200, 503]).toContain(response.status);
+      allowed += 1;
+    }
+    if (denied !== undefined) continue;
+
+    const next = await SELF.fetch(request("/api/health", undefined, ip));
+    if (next.status === 429) return next;
+    // 打满 limit 次之后仍被放行：只可能是窗口在循环中途翻转把计数清零。
+    // 再试一轮；耗尽 maxAttempts 仍如此则让调用方的断言翻红。
+  }
+  throw new Error(
+    `限流窗口在 ${maxAttempts} 轮内始终被翻转，无法构造「打满窗口后 429」的稳定场景（IP=${ip}）`,
+  );
+}
+
 describe("限流", () => {
   // 把限流窗口打满：wrangler.jsonc 声明 limit=60 / period=60，同一个 IP 连发
-  // 61 次，前 60 次放行、第 61 次起 429。头几次请求都打 /api/health（KV 为空
-  // 时 503 也算「放行」——限流判的是请求次数，不是响应状态）。
+  // 61 次，前 60 次放行、第 61 次起 429。
   //
   // 这条同时也是 health 走限流的存在性证明：如果装配层给 health 开了免限流
   // 的口子，第 61 次 health 仍会返回 503 而不是 429，循环结束后的断言翻红。
@@ -511,14 +554,7 @@ describe("限流", () => {
     const ip = freshIP();
     const limit = 60;
 
-    for (let index = 0; index < limit; index += 1) {
-      const response = await SELF.fetch(request("/api/health", undefined, ip));
-      // 前 60 次必须都被放行：KV 为空时健康检查答 503，这正是「放行」的证据，
-      // 断言 429 之外的状态才能确认它们真的走完了 mux。
-      expect([200, 503]).toContain(response.status);
-    }
-
-    const denied = await SELF.fetch(request("/api/health", undefined, ip));
+    const denied = await fillWindow(ip, limit);
     expect(denied.status).toBe(429);
     expect(denied.headers.get("Retry-After")).toBe("60");
     expect(await denied.json()).toEqual({ error: "rate_limited" });
@@ -529,9 +565,7 @@ describe("限流", () => {
 
   it("被限流的请求不再放行到 search", async () => {
     const ip = freshIP();
-    for (let index = 0; index < 60; index += 1) {
-      await SELF.fetch(request("/api/health", undefined, ip));
-    }
+    await fillWindow(ip, 60);
 
     const denied = await SELF.fetch(request("/api/search?q=%E5%BC%A0", undefined, ip));
     expect(denied.status).toBe(429);

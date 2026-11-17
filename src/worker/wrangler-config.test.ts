@@ -193,4 +193,3 @@ describe("wrangler.jsonc 部署契约", () => {
     expect(viteOutDir(), `${VITE_CONFIG_PATH} 的 outDir 与 wrangler 的 assets.directory 不一致`).toBe(wranglerOutDir);
   });
 });
-
