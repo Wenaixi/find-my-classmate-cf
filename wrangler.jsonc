@@ -1,0 +1,45 @@
+// Workers 部署配置的最小形态，本任务只承担「让 cloudflareTest 能加载一份真实的
+// 绑定义与入口」这一个职责。完整的环境、路由与可观测性配置由 Task 17 补齐。
+//
+// 字段取舍：
+// - main 指向 worker 装配层；cloudflareTest 未显式给 main 时从这里取。
+// - compatibility_date 写当日。迁移期不钉旧日期：本仓没有依赖旧兼容行为的代码，
+//   钉一个更早的日期只会让 nodejs_compat 之类的默认行为退回旧形态。
+// - kv_namespaces 只声明 binding。真实部署需要 id，那是账号内的资源标识，
+//   本地 workerd 用 miniflare 的内存 KV 模拟，测试与本地开发都不需要它；
+//   Task 17 会补上 id 与 preview_id。
+// - ratelimits 的 namespace_id 是账号内唯一的整数标识。limit/period 取 Go 端的
+//   同形语义：突发容量 60、窗口 60 秒（server/config.go 的 rateCapacity=60、
+//   rateInterval=1s，Go 是令牌桶匀速回补，Workers 的 simple 只有固定窗口，
+//   此处取「每分钟 60 次」这一与 Go 突发容量对齐的口径）。
+// - assets 的 directory 指向构建产物实际目录（Ruling 1）。server/web 是
+//   Go 侧内嵌的前端构建输出，也是迁移期唯一存在的构建产物目录；Task 19 删 Go
+//   时改为 dist。
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "find-my-classmate-cf",
+  "main": "src/worker/index.ts",
+  "compatibility_date": "2026-11-17",
+  "kv_namespaces": [
+    {
+      "binding": "ROSTER"
+    }
+  ],
+  "ratelimits": [
+    {
+      "name": "API_RATE_LIMITER",
+      "namespace_id": "1001",
+      "simple": {
+        "limit": 60,
+        "period": 60
+      }
+    }
+  ],
+  "assets": {
+    "directory": "./server/web",
+    "binding": "ASSETS"
+  },
+  "vars": {
+    "VERSION": "dev"
+  }
+}

@@ -16,5 +16,15 @@
     "noEmit": true,
     "jsx": "react-jsx"
   },
-  "include": ["src"]
+  // src/worker/index.ts 与 index.test.ts 归 tsconfig.worker.json，不在此项目内。
+  // 理由不是分工好看，而是两套全局类型无法共存：本项目用 DOM lib，它把 Request
+  // / Response / Headers 声明成 DOM 形态；worker 侧用 @cloudflare/workers-types，
+  // 它声明的是 Workers 形态（Request 的 cf 属性、Response 的 body 流类型都不同）。
+  // 同一编译项目里两份声明会合并成互相不兼容的重载，装配层传一个 DOM Request
+  // 给 env.ASSETS.fetch 就会编译失败。拆项目后每个文件只见到自己那套全局。
+  //
+  // 排除必须显式列出这两条：include 是 "src" 覆盖全树，光靠 worker 项目 include
+  // 不会把文件从本项目里移走，结果是同一文件被两个项目各编译一次。
+  "include": ["src"],
+  "exclude": ["src/worker/index.ts", "src/worker/index.test.ts", "src/worker/env.d.ts"]
 }
