@@ -102,7 +102,7 @@ KV 布局：
 
 解析契约的**可执行事实源**是 `docs/query-contract.json`，消费方是两个 TS 测试：`src/shared/query.test.ts`（解析层）与 `src/worker/search.test.ts`（搜索层）。迁移期它同时被 Go 侧消费、两侧"对拍"；Go 退役后对拍关系不存在了，语料退回它本来的角色——**唯一权威**，不再是两份实现之间的中介。语料里的期望值当前以 TS 侧的实测结果为准。
 
-## 4. 契约常量与跨端声明的单一 owner
+## 4. 契约常量与共享声明的单一 owner
 
 跨端共享的数值常量只有一处声明：`src/shared/contract.ts`。`src/config.ts` 只 re-export 并额外持有前端私有的 `REQUEST_TIMEOUT_MS`。
 
