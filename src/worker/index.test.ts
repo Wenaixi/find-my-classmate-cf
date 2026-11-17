@@ -429,6 +429,29 @@ describe("未知 /api/* 与静态回退", () => {
     expectCacheControl(response, NO_STORE, "缺失构建产物");
   });
 
+  // 单页回退在页面路由上生效，但在构建产物路径上必须被改回 404。
+  //
+  // wrangler.jsonc 的 not_found_handling 会让资产层对任何未命中文件答 index.html
+  // 且状态 200。两种路径对这件事的期待正相反：
+  //   - 页面路由（如 /school/123）：需要拿到首页，客户端自己解析路径。
+  //   - 构建产物（/assets/*、/fonts/*）：只放哈希文件，不存在客户端路由，拿到
+  //     HTML 就等于「文件缺失」，必须 404。
+  //
+  // 不钉这条的后果在「缺失的 /assets/* 不带 immutable」里已经露出过一半：那条
+  // 会在 SPA 兜底之下先红在 status 上。但状态码翻红不等于判据正确——若有人在
+  // 装配层把这个路径改回 404 却在缓存判据里保留「200 即可长缓存」，这条需要
+  // 独立证明两件事同时成立。
+  it("页面路由走单页回退拿首页，构建产物路径仍答 404", async () => {
+    const page = await SELF.fetch(request("/school/12345"));
+    expect(page.status).toBe(200);
+    expect(page.headers.get("Content-Type") ?? "").toContain("text/html");
+    expectCacheControl(page, NO_STORE, "单页回退页");
+
+    const asset = await SELF.fetch(request("/assets/does-not-exist-hash.js"));
+    expect(asset.status).toBe(404);
+    expect(asset.headers.get("Content-Type") ?? "").not.toContain("text/html");
+  });
+
   // 首页不是构建产物：一年长缓存会让用户永远看到旧页面。
   it("首页 / 为 no-store（不继承产物长缓存）", async () => {
     const response = await SELF.fetch(request("/"));

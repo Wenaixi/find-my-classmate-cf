@@ -11,7 +11,9 @@
     "build": "tsc -b && tsc -p tsconfig.worker.json && vite build",
     "typecheck": "tsc -b --pretty false && tsc -p tsconfig.worker.json --pretty false",
     "test": "vitest run",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "deploy": "wrangler deploy",
+    "deploy:dry-run": "wrangler deploy --dry-run"
   },
   "dependencies": {
     "border-beam": "1.4.1",

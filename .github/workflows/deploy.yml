@@ -1,0 +1,95 @@
+name: Deploy
+
+# 只在打 tag 时部署：v* 形式的版本标签是「这一次要发出去」的唯一信号。
+# 不在 push 主分支时部署，是为了让主分支保持随时可回滚的候选状态——
+# 合并进 main 不等于发布，发布是一个显式动作。
+on:
+  push:
+    tags:
+      - "v*"
+
+# 同一时刻只允许一个部署，且不取消进行中的那个：
+# 部署是替换线上版本，两个并发部署交错会让「哪个版本在线上」变得不可判定。
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: 部署到 Cloudflare Workers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 安装 Node.js 26
+        uses: actions/setup-node@v7
+        with:
+          node-version: 26
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci
+
+      # 与 CI 的守卫同形：本机 npmrc 的 replace-registry-host 会把 lockfile 里的
+      # registry 改回镜像源，带进来就是供应链的镜像依赖。发布流水线上更不容许。
+      - name: 依赖源守卫（锁文件中不得出现镜像源）
+        run: |
+          count=$(grep -c npmmirror package-lock.json || true)
+          if [ "$count" != "0" ]; then
+            echo "错误：package-lock.json 含 $count 处 npmmirror，依赖来源必须是官方 registry。" >&2
+            exit 1
+          fi
+          echo "依赖源守卫通过：锁文件不含镜像源。"
+
+      - name: 类型检查
+        run: npm run typecheck
+
+      - name: 单元测试
+        run: npm test
+
+      # 部署前必须构建：assets.directory 指向 server/web，那是 vite 的产物目录。
+      # 不先构建就 deploy，上传的是一份空资产目录，线上首页会 404。
+      - name: 生产构建
+        run: npm run build
+
+      # 配置校验先于真实上传：ratelimits 的 period 枚举、assets 目录是否存在、
+      # 绑定形状是否合法，都在这一步暴露，而不是在上传那一刻。
+      - name: 部署配置校验（dry-run）
+        run: npm run deploy:dry-run
+
+      # VERSION 用 --var 覆盖 wrangler.jsonc 里的 "dev"：配置文件里的值是本地
+      # 默认值，线上必须回显真实版本，否则 /api/health 无法指出在跑哪个 tag。
+      # GITHUB_REF_NAME 在 tag 触发时就是标签名（如 v1.0.0）。
+      #
+      # secrets.required 在 wrangler 里是强制校验。Worker 已存在时它把 secret 标成
+      # inherit（部署不会删除既有 secret）；但 **Worker 还不存在时 wrangler 直接报
+      # 「required secrets have not been set」并拒绝部署**，而首次部署又无法用
+      # `wrangler secret put` 预先设置——官方给的出路就是 --secrets-file。
+      #
+      # 用临时文件而不是进程替换：wrangler 会用 path.resolve + readFileSync 读这个
+      # 路径，进程替换给的 /dev/fd/N 是 pipe 型 fd，读它依赖平台细节；普通文件确定。
+      # 文件写在 RUNNER_TEMP（不进工作区，也就不会被 artifact 上传），trap 在退出时
+      # 删除——部署失败时同样会清掉。
+      #
+      # JSON 而非 .env 格式：.env 形态会对值展开 $VAR/${VAR}，token 含 $ 时会被静默
+      # 改值。转义由 scripts/gen-secrets-file.mjs 里的 JSON.stringify 负责，那句
+      # 脚本另有 --self-test 本地验证往返（含引号/反斜杠/换行/中文）。
+      #
+      # 每次部署都带这个文件对已存在的 Worker 也安全：值相同即无害覆盖，且保证
+      # 仓库 secret 是 ADMIN_TOKEN 的唯一事实源——轮换只改一处。
+      #
+      # CLOUDFLARE_ACCOUNT_ID 是 wrangler 当前读取的变量名；CF_ACCOUNT_ID 是它的
+      # 废弃别名。
+      - name: 部署
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
+        run: |
+          set -euo pipefail
+          secrets_file="$RUNNER_TEMP/fmc-secrets.json"
+          trap 'rm -f "$secrets_file"' EXIT
+          node scripts/gen-secrets-file.mjs "$secrets_file"
+          npx wrangler deploy \
+            --var VERSION:"${GITHUB_REF_NAME}" \
+            --secrets-file "$secrets_file"

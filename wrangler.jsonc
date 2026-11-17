@@ -1,17 +1,24 @@
-// Workers 部署配置的最小形态，本任务只承担「让 cloudflareTest 能加载一份真实的
-// 绑定义与入口」这一个职责。完整的环境、路由与可观测性配置由 Task 17 补齐。
+// Workers 部署配置。既是 cloudflareTest 的入口与绑定来源，也是 deploy.yml 实际
+// 上传的那份配置——因此这里的每个字段同时是「测试事实」与「生产事实」。
 //
 // 字段取舍：
 // - main 指向 worker 装配层；cloudflareTest 未显式给 main 时从这里取。
 // - compatibility_date 写当日。迁移期不钉旧日期：本仓没有依赖旧兼容行为的代码，
 //   钉一个更早的日期只会让 nodejs_compat 之类的默认行为退回旧形态。
-// - kv_namespaces 只声明 binding。真实部署需要 id，那是账号内的资源标识，
-//   本地 workerd 用 miniflare 的内存 KV 模拟，测试与本地开发都不需要它；
-//   Task 17 会补上 id 与 preview_id。
-// - ratelimits 的 namespace_id 是账号内唯一的整数标识。limit/period 取 Go 端的
-//   同形语义：突发容量 60、窗口 60 秒（server/config.go 的 rateCapacity=60、
-//   rateInterval=1s，Go 是令牌桶匀速回补，Workers 的 simple 只有固定窗口，
-//   此处取「每分钟 60 次」这一与 Go 突发容量对齐的口径）。
+// - kv_namespaces 只声明 binding，不写 id。id 是账号内的资源标识，写死它会把
+//   「哪个账号部署」绑进仓库；wrangler 的自动供给按 name+binding 生成资源名
+//   （find-my-classmate-cf-ROSTER），首次 deploy 时创建并把 id 回写到本文件，
+//   之后有无 id 都能继续部署。本地 workerd 用 miniflare 的内存 KV 模拟，
+//   测试与本地开发都不需要它。实测：删掉 id 后 `deploy --dry-run` 通过，绑定义
+//   metadata 里落成 type: "inherit"。
+// - ratelimits 的 namespace_id 是账号内唯一的整数标识，取值 1001 是固定的
+//   「这个 binding 占哪个命名空间」声明，不需要与任何远端资源对应，因此可以
+//   直接进仓库（与 KV 的 id 不同：KV id 指向一个已创建的资源，rate limit
+//   namespace 只由这个名字标识）。limit/period 取 Go 端的同形语义：突发容量
+//   60、窗口 60 秒（server/config.go 的 rateCapacity=60、rateInterval=1s，Go
+//   是令牌桶匀速回补，Workers 的 simple 只有固定窗口，此处取「每分钟 60 次」
+//   这一与 Go 突发容量对齐的口径）。period 只接受 10 或 60（wrangler schema
+//   的枚举），写别的值在配置校验期即失败。
 // - assets 的 directory 指向构建产物实际目录（Ruling 1）。server/web 是
 //   Go 侧内嵌的前端构建输出，也是迁移期唯一存在的构建产物目录；Task 19 删 Go
 //   时改为 dist。
@@ -55,9 +62,33 @@
   "assets": {
     "directory": "./server/web",
     "binding": "ASSETS",
+    // 兜底页：资产目录内没有对应文件时由平台回 index.html。
+    // 这条是前端单页形态的部署前提：当成单页应用部署后，任意未知**页面**路径
+    // 都拿到首页 HTML（状态 200），而不是资产层的空体 404。
+    //
+    // 但它对构建产物路径是错的，装配层必须改回来：/assets/ 与 /fonts/ 下只放
+    // 哈希命名文件，不存在「客户端路由」用法，那里拿到 HTML 只意味着文件缺失。
+    // 因此 index.ts 的 dispatch 在交给资产层之后，把这两个前缀上的 text/html
+    // 响应改写成 404（并携 no-store）——Go 的 web.go 对缺失构建产物也正是
+    // 404 且不带长缓存。没有这层改写，缺失的 .js 会以 200 HTML 返回并被装配层
+    // 判为「存在」，进而打上一年 immutable，客户端把一段 HTML 缓存成 .js。
+    // 对应断言在 index.test.ts（页面路由拿到首页 / 产物路径仍答 404 两条）。
+    "not_found_handling": "single-page-application",
     "run_worker_first": true
   },
   "vars": {
     "VERSION": "dev"
+  },
+  // secrets.required 只声明「这个 Worker 需要名为 ADMIN_TOKEN 的 secret」，
+  // 不含任何明文值。它的作用有两个：一是让类型生成不再靠 .dev.vars/进程环境
+  // 推断绑定（绑定名单因此有唯一事实源），二是本地 dev 时缺该 secret 会给出
+  // 明确告警，而不是等到运行时读成空串。
+  //
+  // 值与名字要分清：进仓库的是名字，值是 `wrangler secret put ADMIN_TOKEN`
+  // 或 deploy.yml 的 secrets 上下文供给的。
+  "secrets": {
+    "required": [
+      "ADMIN_TOKEN"
+    ]
   }
 }

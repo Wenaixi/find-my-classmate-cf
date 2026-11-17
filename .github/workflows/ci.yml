@@ -7,7 +7,7 @@ on:
 
 jobs:
   frontend:
-    name: 前端 · 类型检查 / 测试 / 构建
+    name: 前端 + Worker · 依赖守卫 / 类型检查 / 测试 / 构建 / 部署配置校验
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -21,6 +21,22 @@ jobs:
       - name: 安装依赖
         run: npm ci
 
+      # 依赖源守卫：本机 ~/.npmrc 的 registry 指向镜像源，`npm install` 之后
+      # package-lock.json 里会出现 npmmirror 的 URL。这类改动不会让任何测试
+      # 翻红，却把整条供应链悄悄换成镜像依赖（T-U1 已记录过复发）。
+      #
+      # 用 grep -c 直接数字比对而不是 `grep -q`：-c 给出的是「有几处」，
+      # 报错信息能带上数量，排查时不必再手动数一遍。grep 无匹配时退出码为 1，
+      # 因此 `|| true` 是必需的，否则守卫会在「零处」这个正确状态下失败。
+      - name: 依赖源守卫（锁文件中不得出现镜像源）
+        run: |
+          count=$(grep -c npmmirror package-lock.json || true)
+          if [ "$count" != "0" ]; then
+            echo "错误：package-lock.json 含 $count 处 npmmirror，依赖来源必须是官方 registry。" >&2
+            exit 1
+          fi
+          echo "依赖源守卫通过：锁文件不含镜像源。"
+
       - name: 依赖漏洞审计
         run: npm audit --audit-level=high
 
@@ -30,8 +46,27 @@ jobs:
       - name: 单元测试
         run: npm test
 
+      # 对拍脚本的自测。零依赖、秒级，守的是 classify 的判据：
+      # 「完全一致 / 数据缺失 / 行为差异 / 被限流」这几类归因错了，
+      # 对拍会把「两侧都错」报成通过，或把环境噪音报成回归。
+      - name: 对拍脚本自测
+        run: node scripts/local-dev.mjs --self-test
+
+      # secrets 文件生成脚本的自测。它只在打 tag 的部署流水线里被真正调用，
+      # CI 里跑一次是为了让转义逻辑（引号/反斜杠/$/换行）在合并前就被验证——
+      # 否则一个写错的值要到发布那一刻才暴露，且表现为「管理端全 401」。
+      - name: secrets 文件脚本自测
+        run: node scripts/gen-secrets-file.mjs --self-test
+
       - name: 生产构建
         run: npm run build
+
+      # 部署配置校验。必须放在「生产构建」之后：实测 assets.directory 不存在时
+      # `wrangler deploy --dry-run` 会直接报
+      # 「The directory specified by the "assets.directory" field ... does not exist」
+      # 并退出。顺序反过来，这一步会在每次干净检出时都红，而原因与配置无关。
+      - name: 部署配置校验（dry-run）
+        run: npm run deploy:dry-run
 
       - name: 上传构建产物
         uses: actions/upload-artifact@v7

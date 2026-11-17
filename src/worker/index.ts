@@ -130,6 +130,10 @@ function isAssetPath(pathname: string): boolean {
 // 304 会落到 no-store，客户端在条件请求之后反而丢掉长缓存——下次还得回源校验，
 // 而一年 immutable 的全部收益就在条件请求这一格。
 //
+// 缺失产物在这里仍走 404：不是靠本函数判 HTML，而是 dispatch 在交给资产层之后
+// 就把「构建产物路径上的 HTML 兜底页」改回 404（见那里的注释）。本函数只看
+// 状态码，因此不需要再猜内容类型。
+//
 // 无 body 的状态码（204/304）必须显式传 null body：给 Response 构造器传一个
 // 非 null body 会抛「Invalid response status code」。
 //
@@ -197,7 +201,32 @@ async function dispatch(request: Request, env: Env, pathname: string): Promise<R
   }
   // 静态资源与页面：Go 端由 frontendHandler 服务，Workers 交给 assets binding。
   // 请求原样透传（不改 URL、不剥查询串），缓存与条件请求语义由平台资产层负责。
-  return env.ASSETS.fetch(request);
+  const response = await env.ASSETS.fetch(request);
+  // 构建产物路径上的缺失文件必须答 404，不能接兜底页。
+  //
+  // wrangler.jsonc 开了 not_found_handling: single-page-application：资产层对
+  // 「目录里没有这个文件」的路径一律回 index.html 且状态 200。这对页面路由是
+  // 需要的（客户端路由要拿到首页去自己解析路径），但对 /assets/ 与 /fonts/ 是
+  // 错的——那两个前缀下只放哈希命名的构建产物，不存在「客户端路由」用法，
+  // 所以 HTML 兜底页在那里只可能意味着文件缺失。
+  //
+  // 不改成 404 的后果有两层：一是缺失的 .js 会以 200 HTML 返回，浏览器把它当
+  // 脚本解析，报的是语法错误而不是拿到 404，排障方向被引偏；二是装配层会按
+  // 「200 + /assets/ 前缀」判它存在，给它打上一年 immutable，客户端随后把这段
+  // HTML 缓存成 .js 整整一年。Go 的 web.go 对缺失构建产物答 404 且不带长缓存
+  // （static_cache_test.go 两条锁这个），这里回到同一形态。
+  //
+  // 判据用 Content-Type 而不是「body 是否等于 index.html」：资产层给兜底页的
+  // 是 text/html，给真实构建产物的是 js/css/woff2 之类，判据与内容比对相比
+  // 少读一次 body，也不会在首页改版后失效。
+  const contentType = response.headers.get("Content-Type") ?? "";
+  if (isAssetPath(pathname) && contentType.startsWith("text/html")) {
+    return new Response("not found", {
+      status: 404,
+      headers: { "Content-Type": "text/plain; charset=utf-8" }
+    });
+  }
+  return response;
 }
 
 // asResponse 把异常收窄成响应：ApiException 走它自己的 toResponse（状态与

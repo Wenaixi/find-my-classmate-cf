@@ -68,6 +68,7 @@ function loadConfig(): Record<string, unknown> {
 interface AssetsConfig {
   directory?: string;
   binding?: string;
+  not_found_handling?: string;
   run_worker_first?: boolean | string[];
 }
 
@@ -121,10 +122,32 @@ describe("wrangler.jsonc 部署契约", () => {
     expect(vars?.VERSION).toBeDefined();
   });
 
-  // ADMIN_TOKEN 刻意不在这里断言：它是 secret，不该以明文进仓库。
-  // 断言「配置里没有它」反而把「走 secret 供给」这条约定钉住。
-  it("ADMIN_TOKEN 不出现在配置文件里（应走 secret 供给）", () => {
+  // ADMIN_TOKEN 的值不得进配置文件，但名字要进 secrets.required。
+  //
+  // 原断言是 `raw not.toContain("ADMIN_TOKEN")`，钉的是「走 secret 供给」这条
+  // 约定。Task 17 按部署规格补了 secrets.required 之后那条会翻红——它不是约定
+  // 失效，而是断言写得太粗：把「名字」和「值」当成了同一个东西。进仓库的名字
+  // 只是绑定声明，泄露风险在值上。
+  //
+  // 因此拆成两条更精确的断言：
+  //   1. secrets.required 里确实声明了这个名字（部署期缺 secret 要能报出来，
+  //      而不是运行时读成空串）；
+  //   2. 配置里没有把名字当键赋值的形态（"ADMIN_TOKEN": "..."），值只能来自
+  //      `wrangler secret put` 或部署流水线的 secrets 上下文。
+  it("ADMIN_TOKEN 只在 secrets.required 里声明名字，不带值", () => {
+    const secrets = config.secrets as { required?: string[] } | undefined;
+    expect(secrets?.required, "缺少 secrets.required 声明").toBeDefined();
+    expect(secrets?.required).toContain("ADMIN_TOKEN");
+
     const raw = readFileSync(CONFIG_PATH, "utf8");
-    expect(raw).not.toContain("ADMIN_TOKEN");
+    // 赋值形态：名字作键、后跟冒号。JSONC 里若写了值一定长这样。
+    expect(raw, "ADMIN_TOKEN 不得以键值形式带明文值").not.toMatch(/"ADMIN_TOKEN"\s*:/);
+  });
+
+  // 单页回退与产物目录是部署形态的一部分，写错会让页面路由拿不到首页、
+  // 或让 deploy 上传一份空资产。
+  it("assets 声明了单页回退与迁移期产物目录", () => {
+    expect(assets?.not_found_handling).toBe("single-page-application");
+    expect(assets?.directory).toBe("./server/web");
   });
 });
