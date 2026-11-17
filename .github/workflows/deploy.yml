@@ -50,9 +50,9 @@ jobs:
         run: npm run typecheck
 
       # 构建必须早于测试，理由与 ci.yml 同一条：worker 集成测试的 firstAssetPath()
-      # 与 firstFontPath() 从 server/web 的真实产物里取哈希路径，而 server/web 在
-      # .gitignore 里、`npm ci` 不产出它。顺序反了会在第 7 步就红，tag 永远走不到
-      # 部署，且失败信息看起来像「测试坏了」而不是「流水线坏了」。
+      # 与 firstFontPath() 从 dist 的真实产物里取哈希路径，而 dist 在 .gitignore
+      # 里、`npm ci` 不产出它。顺序反了会在第 7 步就红，tag 永远走不到部署，
+      # 且失败信息看起来像「测试坏了」而不是「流水线坏了」。
       #
       # 顺序固定为：npm ci → 守卫 → typecheck → build → test → dry-run → deploy。
       - name: 生产构建

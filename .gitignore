@@ -3,7 +3,6 @@ node_modules/
 
 # 构建产物
 dist/
-server/web/
 *.tsbuildinfo
 
 # 日志与运行数据
@@ -15,10 +14,6 @@ data/log/
 .env.*
 .dev.vars
 !.env.example
-
-# Go 构建产物
-server/findmyclassmate
-server/findmyclassmate.exe
 
 # 系统与编辑器
 .DS_Store
@@ -38,7 +33,6 @@ docs/superpowers/
 
 # OMC 运行时状态（跨项目工具产生的操作性工件，不进仓库）
 .omc/
-server/.omc/
 
 # 设计源文件（public/ 下的产物才是引用处）
 design/
@@ -57,7 +51,6 @@ coverage/
 *.config.d.ts
 vite.config.d.ts
 vitest.config.d.ts
-server/server.exe
 
 # 本地脚本
 .perf-gzip.ps1
@@ -68,8 +61,7 @@ data/*.json
 # 壁纸孤儿目录（功能未合入）
 data/wallpaper/
 
-# 单模块仓库不需要 go.work；release-body 是 CI 中间产物
-go.work
+# release-body 是 CI 中间产物（Release 流水线按 tag 从 CHANGELOG 抽出正文）
 release-body.md
 data/_legacy/
 

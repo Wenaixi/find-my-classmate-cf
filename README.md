@@ -2,7 +2,7 @@
 
 > 校园学生档案检索台
 
-FindMyClassmate 是一个面向校园场景的班级查询工具。React + TypeScript 前端构建后嵌入 Go 标准库服务，由后端统一托管页面、接口和年级名单，单二进制即可部署。
+FindMyClassmate 是一个面向校园场景的班级查询工具。React + TypeScript 前端构建后由 Cloudflare Worker 托管，名单存放在 Workers KV，页面、接口与静态资源由同一个 Worker 对外服务，无需常驻服务器或容器。
 
 ## 功能
 
@@ -16,30 +16,74 @@ FindMyClassmate 是一个面向校园场景的班级查询工具。React + TypeS
 
 | 层 | 技术 |
 | --- | --- |
-| 前端 | React 18 + TypeScript + Vite |
-| 后端 | Go 标准库 HTTP 服务（单二进制） |
-| 动效 | border-beam 1.3.0 / thinking-orbs 0.3.1 / liquid-gooey 0.2.1 |
+| 前端 | React 19 + TypeScript + Vite |
+| 运行时 | Cloudflare Workers（单 Worker 同时托管页面、接口与静态资源） |
+| 存储 | Workers KV（`roster:{校名}` 一校一键，名单不进仓库） |
+| 动效 | border-beam 1.4.1 / thinking-orbs 0.3.2 / liquid-gooey 0.2.2 |
 | 字体 | Mona Sans / Instrument Sans / IBM Plex Mono |
-| 测试 | Vitest（前端）、Go test（后端） |
+| 测试 | Vitest（前端 + workerd 集成，双项目） |
 
-## 快速开始
+## 本地开发
 
-前置：Node.js 26（CI 使用的版本）、Go 1.26。
+前置：Node.js 26。
 
 ```bash
-# 1. 安装前端依赖
+# 1. 安装依赖
 npm install
 
-# 2. 构建前端（产物输出到 server/web/）
+# 2. 构建前端（产物输出到 dist/）
 npm run build
 
-# 3. 启动 Go 服务（默认端口 3078）
-go run ./server
+# 3. 启动本地 Worker（默认端口 8787）
+npx wrangler dev --port 8787
 
-# 4. 浏览器打开 http://localhost:3078
+# 4. 浏览器打开 http://localhost:8787
 ```
 
-数据目录默认 `./data`，可通过环境变量 `FMC_DATA_DIR` 指向其他目录。名单文件变更后下一次请求自动热重载；日志写入 `FMC_LOG_DIR`（默认 `<数据目录>/log`），容器场景建议显式指定可写目录。
+只想改前端样式时可 `npm run dev` 起 Vite（端口 5173），`/api` 请求会代理到本地 Worker 的 8787，因此仍需先起 `wrangler dev`。
+
+本地名单：Worker 的 KV 在 `.wrangler/` 下本地模拟，新克隆的仓库里是空的。放一份 `data/*_roster.json` 后用管理 API 灌入：
+
+```bash
+# 本地管理 token 写在 .dev.vars（该文件不进仓库）
+node scripts/upload-roster.mjs http://127.0.0.1:8787 <token> data
+```
+
+## 部署
+
+部署形态是单个 Worker：`wrangler deploy` 一次上传脚本 + `dist/` 静态产物，没有 Docker、没有常驻进程。
+
+### 首次准备
+
+```bash
+# 登录（或改用 CLOUDFLARE_API_TOKEN 环境变量给 CI 用）
+npx wrangler login
+
+# 管理端凭据：值为任意长随机串，只写进 Cloudflare，不进仓库
+npx wrangler secret put ADMIN_TOKEN
+```
+
+`wrangler.jsonc` 里的 `kv_namespaces` 只声明 binding 名 `ROSTER`、不写 id：首次 `deploy` 时 wrangler 会按名字自动创建命名空间并把 id 回写到该文件。
+
+### 部署与灌名单
+
+```bash
+# 上线（生产）
+npx wrangler deploy
+
+# 线上名单：管理 API 上传，一校一 PUT，写入后全站生效
+node scripts/upload-roster.mjs https://<你的 Worker 域名> "$ADMIN_TOKEN" data
+```
+
+`/api/admin/roster` 是管理端点（`GET` 列表、`PUT` 上传、`DELETE` 删除），全部要求 `Authorization: Bearer <ADMIN_TOKEN>`。名单存 KV，写入后各边缘节点最多约 60 秒刷新，不是秒级生效。
+
+### GitHub Actions
+
+- `.github/workflows/ci.yml`：依赖源守卫 → 类型检查 → 构建 → 测试 → dry-run。
+- `.github/workflows/deploy.yml`：打 `v*` tag 时部署，需要仓库 secrets `CLOUDFLARE_API_TOKEN`、`CLOUDFLARE_ACCOUNT_ID`（或 `CF_ACCOUNT_ID`）、`ADMIN_TOKEN`。
+- `.github/workflows/release.yml`：同一 tag 触发，按 CHANGELOG 生成 GitHub Release 记录。发布包不含二进制、镜像或名单数据。
+
+`ADMIN_TOKEN` 的唯一事实源是仓库 secret：每次部署都会按它覆盖线上值，因此在 Cloudflare 控制台改这个 secret 会被下一次部署静默回退。
 
 ## 站点文案配置
 

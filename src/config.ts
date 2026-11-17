@@ -1,7 +1,5 @@
 // 前端消费入口：跨端契约常量 re-export 自 shared/contract.ts（唯一事实源），
 // 本文件不再声明这些数值，只保留前端私有的 REQUEST_TIMEOUT_MS。
-// 后端 server/config.go 的注释指向 shared/contract.ts，跨语言对拍
-// （server/contract_constants_test.go）读的也是那份 owner 文件。
 
 export { PAGE_SIZE, MAX_LIMIT, MAX_QUERY_LENGTH } from "./shared/contract";
 

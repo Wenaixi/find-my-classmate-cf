@@ -2,10 +2,9 @@
 // 一律从本文件取值：types.ts 只 re-export Grade，shared/query.ts 在本文件取
 // gradeValues / gradeAliases。
 //
-// 年段值域与 Go 端 search.go 的 knownGrades 保持同一份事实。硬编码会使
-// 「扩展年段只需在 knownGrades 追加」在两端同时失效，且跨语言对拍无法发现——
-// 两端一致地不认识新年段，对拍语料必须先有该年段样本。扩展年段时按惯例
-// 同步两端：Go 端追加 knownGrades，本文件追加联合与列表。
+// 年段值域与迁移前 Go 端 search.go 的 knownGrades 曾是同一份事实，Go 退役后
+// 本文件是唯一声明处。扩展年段时只改本文件：追加 Grade 联合与 gradeValues，
+// 下方的反向完整性检查会在漏改一侧时立即报错。
 //
 // 声明为字面量元组而非 ReadonlyArray<Grade>：显式类型标注会把字面量拓宽回
 // Grade，于是「Grade 联合里有、gradeValues 里缺」在类型层面恒成立，下方的

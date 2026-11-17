@@ -1,5 +1,9 @@
 name: Release
 
+# 发布流水线的两半：deploy.yml 负责把 Worker 真正推上线，本文件负责写 GitHub
+# Release 记录。两者都由 tag 触发、互不依赖——部署失败不该让发布记录缺失，
+# 发布记录失败也不该拦住部署。合并成一个 job 会让「线上跑的是哪个版本」与
+# 「仓库里记录了哪个版本」互相拖累。
 on:
   push:
     tags: ["v*"]
@@ -8,43 +12,8 @@ permissions:
   contents: write
 
 jobs:
-  test:
-    name: 全量测试
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: 安装 Node.js 26
-        uses: actions/setup-node@v7
-        with:
-          node-version: 26
-          cache: npm
-
-      - name: 前端依赖与构建
-        run: |
-          npm ci
-          npm run typecheck
-          npm test
-          npm run build
-
-      - name: 安装 Go 1.26
-        uses: actions/setup-go@v7
-        with:
-          go-version: "1.26"
-
-      - name: 后端测试与静态检查
-        working-directory: server
-        run: |
-          test -z "$(gofmt -l .)"
-          go test ./...
-          go vet ./...
-
-      - name: 数据契约校验（真实数据不随仓库发布，跳过；校内部署请运行 go test）
-        run: echo "数据文件不随仓库分发，数据契约由 server/data_test.go 保证，校内部署时运行 go test ./..."
-
   release:
-    name: 构建发布产物
-    needs: test
+    name: 校验并生成 GitHub Release
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -55,35 +24,38 @@ jobs:
           node-version: 26
           cache: npm
 
-      - name: 安装前端依赖并构建
-        run: |
-          npm ci
-          npm run build
+      - name: 安装依赖
+        run: npm ci
 
-      - name: 安装 Go 1.26
-        uses: actions/setup-go@v7
-        with:
-          go-version: "1.26"
-
-      - name: 交叉编译发布二进制
-        working-directory: server
+      # 与 CI 同形的依赖源守卫（含文件存在性判断，理由见 ci.yml 同名步骤注释）：
+      # 发布流水线上更不容许镜像源进锁文件。
+      - name: 依赖源守卫（锁文件中不得出现镜像源）
         run: |
-          mkdir -p ../release
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w -X main.version=${{ github.ref_name }}" -o ../release/findmyclassmate-linux-amd64 .
-          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "-s -w -X main.version=${{ github.ref_name }}" -o ../release/findmyclassmate-darwin-arm64 .
-          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w -X main.version=${{ github.ref_name }}" -o ../release/findmyclassmate-windows-amd64.exe .
+          if [ ! -f package-lock.json ]; then
+            echo "错误：package-lock.json 不存在，依赖安装未完成或锁文件被删。" >&2
+            exit 1
+          fi
+          count=$(grep -c npmmirror package-lock.json || true)
+          if [ "$count" != "0" ]; then
+            echo "错误：package-lock.json 含 $count 处 npmmirror，依赖来源必须是官方 registry。" >&2
+            exit 1
+          fi
+          echo "依赖源守卫通过：锁文件不含镜像源。"
 
-      - name: 归档发布包
-        run: |
-          mkdir -p release-package
-          cp -r release/findmyclassmate-* release-package/
-          # 前端产物已嵌入二进制，不再单独随包分发 server/web：
-          # 归档中保留它会形成第二个资产事实源，且暗示使用者可以替换嵌入资产。
-          # 发布包不附带任何名单数据：真实名单仅限校内部署（data/ 不入库），
-          # 使用者按 README 的数据格式章节自行准备 data/ 下的年段名单（高一/高二/高三，可只放存在的年段）
-          mkdir -p release-package/data
-          cp README.md LICENSE CHANGELOG.md release-package/
-          cd release-package && tar -czf ../findmyclassmate.tar.gz .
+      # 打 tag 前必须已经全绿，这里再跑一遍是因为 tag 可能打在未过 CI 的提交上，
+      # 而 GitHub Release 一旦写出就是对外承诺。顺序同样是 build 先于 test
+      # （理由见 ci.yml：worker 集成测试需要 dist 里有真实产物）。
+      - name: 类型检查
+        run: npm run typecheck
+
+      - name: 生产构建
+        run: npm run build
+
+      - name: 单元测试
+        run: npm test
+
+      - name: 部署配置校验（dry-run）
+        run: npm run deploy:dry-run
 
       - name: 提取更新记录（按当前 tag 精确匹配，找不到则显式失败）
         run: |
@@ -107,54 +79,12 @@ jobs:
             exit 1
           }
 
+      # 发布包不含任何二进制或容器镜像：部署形态是 `wrangler deploy`，线上版本
+      # 由 Cloudflare 托管，仓库不再产出可下载产物。Release 只是版本记录，
+      # 因此也不附名单数据（真实名单不进仓库，由管理 API 上传到 KV）。
       - name: 创建 GitHub Release
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
           name: FindMyClassmate ${{ github.ref_name }}
           body_path: release-body.md
-          files: |
-            findmyclassmate.tar.gz
-            release/findmyclassmate-linux-amd64
-            release/findmyclassmate-darwin-arm64
-            release/findmyclassmate-windows-amd64.exe
-  docker:
-    name: 构建并推送 Docker 镜像
-    needs: test
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: 设置 Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: 登录 Docker Hub
-        uses: docker/login-action@v4
-        with:
-          username: wenxiloveyou
-          password: ${{ secrets.DOCKER_PAT }}
-
-      - name: 提取镜像元数据
-        id: meta
-        uses: docker/metadata-action@v6
-        with:
-          images: wenxiloveyou/find-my-classmate
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable={{is_default_branch}}
-
-      - name: 构建并推送镜像
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            VERSION=${{ github.ref_name }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max

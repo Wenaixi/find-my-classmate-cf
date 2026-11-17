@@ -1,7 +1,7 @@
 // Workers 装配层：把 handlers / admin / middleware / errors / rosterStore 拼成一条
-// 与 Go 端 chain 同形、同序的请求链，并给出 fetch 入口。
+// 请求链，并给出 fetch 入口。
 //
-// 链顺序（由外到内）逐条对齐 server/main.go 的 newHandlerChainWith：
+// 链顺序（由外到内）沿用迁移前 Go 端 newHandlerChainWith 的形态：
 //
 //   securityHeaders -> rateLimit -> accessLog -> mux
 //

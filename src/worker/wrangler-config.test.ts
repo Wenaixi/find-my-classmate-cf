@@ -155,6 +155,6 @@ describe("wrangler.jsonc 部署契约", () => {
   // 或让 deploy 上传一份空资产。
   it("assets 声明了单页回退与迁移期产物目录", () => {
     expect(assets?.not_found_handling).toBe("single-page-application");
-    expect(assets?.directory).toBe("./server/web");
+    expect(assets?.directory).toBe("./dist");
   });
 });

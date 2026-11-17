@@ -19,9 +19,9 @@
 //   是令牌桶匀速回补，Workers 的 simple 只有固定窗口，此处取「每分钟 60 次」
 //   这一与 Go 突发容量对齐的口径）。period 只接受 10 或 60（wrangler schema
 //   的枚举），写别的值在配置校验期即失败。
-// - assets 的 directory 指向构建产物实际目录（Ruling 1）。server/web 是
-//   Go 侧内嵌的前端构建输出，也是迁移期唯一存在的构建产物目录；Task 19 删 Go
-//   时改为 dist。
+// - assets 的 directory 指向构建产物实际目录：vite 的 build.outDir 就是 dist，
+//   两处必须同名（wrangler-config.test.ts 有一条用例把这两个字段钉在一起）。
+//   迁移完成后，原 Go 侧内嵌的 server/web 已随 Go 一并删除，dist 是唯一产物目录。
 //
 // - assets 的 run_worker_first 必须为 true，这不是可选项：
 //
@@ -60,7 +60,7 @@
     }
   ],
   "assets": {
-    "directory": "./server/web",
+    "directory": "./dist",
     "binding": "ASSETS",
     // 兜底页：资产目录内没有对应文件时由平台回 index.html。
     // 这条是前端单页形态的部署前提：当成单页应用部署后，任意未知**页面**路径

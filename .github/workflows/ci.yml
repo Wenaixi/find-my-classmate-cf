@@ -7,7 +7,7 @@ on:
 
 jobs:
   frontend:
-    name: 前端 + Worker · 依赖守卫 / 类型检查 / 测试 / 构建 / 部署配置校验
+    name: 前端 + Worker · 依赖守卫 / 类型检查 / 构建 / 测试 / 部署配置校验
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -54,12 +54,11 @@ jobs:
       # 生产构建必须早于单元测试：worker 集成测试跑的是真实装配链，其中的
       # firstAssetPath() 从首页 HTML 提取真实的 /assets/* 哈希路径、firstFontPath()
       # 从 CSS 提取 /fonts/*，这五条用例（非 /api 回退、/assets 长缓存、304、
-      # /fonts 长缓存、单页回退）全部依赖 server/web 里真有一份产物。
+      # /fonts 长缓存、单页回退）全部依赖 dist 里真有一份产物。
       #
-      # server/web 在 .gitignore 里，`npm ci` 不产出它，package.json 也没有
-      # pretest 钩子——干净检出上先跑 test 必红 5 条，而这 5 条红的信息看起来像
-      # 「静态资源分支坏了」，实际只是构建没跑。实测：移走 server/web 后
-      # npx vitest run src/worker/index.test.ts → 5 failed。
+      # dist 在 .gitignore 里，`npm ci` 不产出它，package.json 也没有 pretest
+      # 钩子——干净检出上先跑 test 必红 5 条，而这 5 条红的信息看起来像
+      # 「静态资源分支坏了」，实际只是构建没跑。
       #
       # 顺序因此固定为：npm ci → 守卫 → typecheck → build → test → dry-run。
       - name: 生产构建
@@ -68,17 +67,16 @@ jobs:
       - name: 单元测试
         run: npm test
 
-      # 对拍脚本的自测。零依赖、秒级，守的是 classify 的判据：
-      # 「完全一致 / 数据缺失 / 行为差异 / 被限流」这几类归因错了，
-      # 对拍会把「两侧都错」报成通过，或把环境噪音报成回归。
-      - name: 对拍脚本自测
-        run: node scripts/local-dev.mjs --self-test
-
       # secrets 文件生成脚本的自测。它只在打 tag 的部署流水线里被真正调用，
       # CI 里跑一次是为了让转义逻辑（引号/反斜杠/$/换行）在合并前就被验证——
       # 否则一个写错的值要到发布那一刻才暴露，且表现为「管理端全 401」。
       - name: secrets 文件脚本自测
         run: node scripts/gen-secrets-file.mjs --self-test
+
+      # 名单上传脚本的自测。同理：它只在真实部署或校内迁移名单时被调用，
+      # CI 里跑一次把「按校拆分 + URL 编码 + 失败归类」的逻辑在合并前验证掉。
+      - name: 名单上传脚本自测
+        run: node scripts/upload-roster.mjs --self-test
 
       # 部署配置校验。同样必须在构建之后：实测 assets.directory 不存在时
       # `wrangler deploy --dry-run` 会直接报
@@ -86,66 +84,6 @@ jobs:
       # 并退出。
       - name: 部署配置校验（dry-run）
         run: npm run deploy:dry-run
-
-      - name: 上传构建产物
-        uses: actions/upload-artifact@v7
-        with:
-          name: frontend-build
-          path: server/web
-          if-no-files-found: error
-
-  backend:
-    name: 后端 · 复用前端产物 / 格式化检查 / 测试 / 静态检查
-    runs-on: ubuntu-latest
-    needs: frontend
-    steps:
-      - uses: actions/checkout@v7
-
-      # web.go 的 //go:embed all:web 需要 server/web 产物。
-      # 复用 frontend job 的构建产物而非重建：前端只构建一次，
-      # 测试与编译看到的是与 CI 验证过的完全相同的字节。
-      - name: 下载前端构建产物
-        uses: actions/download-artifact@v8
-        with:
-          name: frontend-build
-          path: server/web
-
-      - name: 安装 Go 1.26
-        uses: actions/setup-go@v7
-        with:
-          go-version: "1.26"
-
-      - name: 格式化检查
-        working-directory: server
-        run: |
-          gofmt -l .
-          test -z "$(gofmt -l .)"
-
-      - name: 单元测试
-        working-directory: server
-        run: go test -race ./...
-
-      - name: 静态检查
-        working-directory: server
-        run: go vet ./...
-
-  docker:
-    name: Docker · 镜像构建验证
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: 设置 Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: 构建镜像（多阶段，前端现场构建后嵌入）
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          push: false
-          tags: findmyclassmate:ci
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
 
   data:
     name: 数据边界守卫 · 真实名单零数据检测
@@ -156,12 +94,11 @@ jobs:
       - name: 数据边界守卫（真实名单不随仓库分发）
         run: |
           # 真实名单（data/*.json）不进仓库、不进发布包；仓库中不应存在任何名单数据。
-          # 数据契约由 server/data_test.go 以合成 fixture 覆盖。
-          # 真实名单形态由 TestRealRosterIsLoadable 单独把关：它读取
-          # ../data（可用 FMC_TEST_ROSTER_DIR 覆盖），无名单时跳过——
-          # 因此 CI 恒跳过，只有校内部署放置名单后该门禁才真正执行。
+          # 名单的结构校验与加载契约由 src/shared/roster.test.ts 与
+          # src/worker/rosterStore.test.ts 以合成 fixture 覆盖，在 frontend job 里已跑。
+          # 真实名单形态另由上传脚本的 --self-test 与校内部署时的实测把关。
           if ls data/*.json >/dev/null 2>&1; then
             echo "错误：data/ 目录包含名单数据文件，真实名单不得随仓库分发（隐私红线）。" >&2
             exit 1
           fi
-          echo "零数据守卫通过：仓库无名单数据文件；名单加载契约由 server/data_test.go 覆盖。"
+          echo "零数据守卫通过：仓库无名单数据文件；名单加载契约由 TS 侧测试覆盖。"
