@@ -3,15 +3,22 @@
 // 这个文件由 tsconfig.node.json 编译，不由 tsconfig.app.json 编译。
 //
 // 为什么不留在 app 项目里只加一条文件级 /// <reference types="node" />：
-// TypeScript 的全局声明没有文件作用域。某个文件一旦引入 @types/node，它的
-// process / Buffer / __dirname 等全局就对**整个编译单元**可见——实测把本文件
-// 移走后，一个不含任何 reference 的探针文件立刻报 TS2591；放回本文件，同一个
-// 探针又编译通过。所以「文件级 reference 能把 Node 类型压到单文件」这条路
-// 不成立，只能靠编译项目边界来隔离。
+// 因为 Node 类型是 **program 级泄漏**，不是文件级作用域。本项目里只要有一个
+// 文件引入 @types/node（无论是 reference 还是 import 需要 node 类型的模块），
+// 它的 process / Buffer / __dirname 等全局就对**整个编译单元**可见。
+//
+// 实测（隔离项目，moduleResolution: Bundler）：
+//   - 同一文件、types: [] 之下，加 reference → process 编译通过；删 reference
+//     → TS2591。所以 types: [] 并不抑制 reference，它只是不主动纳入。
+//   - 裸文件自己不带 reference，但同项目里存在一个带 reference 的兄弟文件
+//     → 裸文件的 process 也编译通过。泄漏由此而来。
+// 因此「文件级 reference 能把 Node 类型压到单文件」不成立，隔离只能靠编译
+// 项目边界。
 //
 // 归属：tsconfig.node.json（本来就装 vite.config.ts / vitest.config.ts 这类
-// 纯 Node 代码的项目）显式声明 types: ["node"]；tsconfig.app.json 声明
-// types: []，前端项目因此完全见不到 Node 全局。
+// 纯 Node 代码的项目）显式声明 types: ["node"]；本文件由它编译，因此可以
+// 直接 import node:fs，不需要自带 reference。tsconfig.app.json 声明 types: []
+// 并把本文件列进 exclude，前端项目的类型环境因此不含 Node 全局。
 //
 // 为什么必须有这一组：wrangler.jsonc 里 assets.run_worker_first 决定平台是否
 // 先把请求交给 Worker 脚本。它默认为关闭，此时命中的静态文件直接由 Asset
