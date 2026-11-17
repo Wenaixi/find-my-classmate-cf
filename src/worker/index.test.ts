@@ -116,6 +116,52 @@ function expectCacheControl(response: Response, expected: string, label: string)
   expect(response.headers.get("Cache-Control"), `${label} 的 Cache-Control`).toBe(expected);
 }
 
+// firstAssetPath 从首页 HTML 里取出一个真实的 /assets/* 构建产物路径。
+//
+// 不硬编码文件名：构建产物带内容哈希，重建后哈希变、硬编码失效。此时断言会
+// 退化成「两侧都 404」，看起来仍然成立却什么都没验证（缓存那条会因 status
+// 不是 200 而红，但对照等式那条会静默通过）。
+//
+// 找不到就抛错而不是返回空串：让用例以「首页未引用构建产物」明确失败，
+// 而不是靠一个假路径混过去。
+async function firstAssetPath(): Promise<string> {
+  const page = await SELF.fetch(request("/"));
+  const html = await page.text();
+  const match = html.match(/\/assets\/[A-Za-z0-9._-]+\.(?:js|css)/);
+  if (match === null) {
+    throw new Error("首页未引用任何 /assets/* 构建产物");
+  }
+  return match[0];
+}
+
+// firstFontPath 从构建 CSS 里取一个真实的 /fonts/* 路径。
+//
+// 字体是从 CSS 的 @font-face 引用进去的，不在首页 HTML 里，也不一定在 JS 里
+// （实测 JS 产物里不含 /fonts/ 引用，直接拿 firstAssetPath 的 JS 会导致这条
+// 用例以「未引用字体」失败）。所以这里专门找 CSS 产物，再在它内部找 /fonts/。
+//
+// 字体文件名本身不带哈希（原样拷贝），但走提取路径可避免「某天字体改成哈希
+// 命名后这条悄悄失效」。
+//
+// 缺失时抛错：/fonts/ 前缀若有实现无断言，把前缀缩成 ["/assets/"] 不会有任何
+// 测试翻红——实现写了但没人守。
+async function firstFontPath(): Promise<string> {
+  const page = await SELF.fetch(request("/"));
+  const html = await page.text();
+  const cssMatch = html.match(/\/assets\/[A-Za-z0-9._-]+\.css/);
+  if (cssMatch === null) {
+    throw new Error("首页未引用任何 /assets/*.css 构建产物");
+  }
+
+  const response = await SELF.fetch(request(cssMatch[0]));
+  const css = await response.text();
+  const match = css.match(/\/fonts\/[A-Za-z0-9._-]+\.(?:woff2|woff|ttf)/);
+  if (match === null) {
+    throw new Error(`${cssMatch[0]} 未引用任何 /fonts/* 字体`);
+  }
+  return match[0];
+}
+
 // rosterJson 构造上游 build_hierarchy_json.py 形状的名单原文。
 // 形状必须真的是这一份：rosterStore 委托 shared/roster.ts 校验，
 // 结构不对会在加载期就抛错，测试就会以「503 而不是 200」的形式失败，
@@ -298,7 +344,11 @@ describe("未知 /api/* 与静态回退", () => {
     // 两边同源，所以「产物在、都命中 200」与「产物缺、都 404」都成立；它真正
     // 承重的是「装配链走的就是这个 assets binding」——把 dispatch 里的
     // env.ASSETS.fetch 换成任何别的响应来源，等式立刻破裂。
-    for (const path of ["/", "/assets/index-CPmbohEI.js"]) {
+    //
+    // 第二条路径从首页 HTML 现取（firstAssetPath），不硬编码哈希：硬编码的路径
+    // 在产物重建后会两侧都变 404，等式看似成立实则退化成「产物缺失」场景。
+    const assetPath = await firstAssetPath();
+    for (const path of ["/", assetPath]) {
       const viaWorker = await SELF.fetch(request(path));
       const direct = await env.ASSETS.fetch(new Request(`https://fmc.example${path}`));
 
@@ -315,24 +365,63 @@ describe("未知 /api/* 与静态回退", () => {
   });
 
   // 构建产物的一年长缓存（对齐 Go 的 assetCacheMaxAge）。
-  // 文件名带哈希且会随构建变化，因此从 / 的 HTML 里取出真实的 /assets/ 引用，
-  // 而不是硬编码 index-CPmbohEI.js——硬编码会随构建产物一起腐烂。
+  // 文件名带哈希且会随构建变化，因此从 / 的 HTML 里取真实的 /assets/ 引用，
+  // 而不是硬编码某个哈希——硬编码会在重建产物换哈希后静默退化成「都 404」。
   it("/assets/* 命中后带一年 immutable 长缓存", async () => {
-    const page = await SELF.fetch(request("/"));
-    const html = await page.text();
-    const match = html.match(/\/assets\/[A-Za-z0-9._-]+\.(?:js|css)/);
-    // 产物缺失时不跳过断言，而是明确失败：这条用例的价值就在于锁缓存头，
-    // 静默跳过会让「产物没构建」伪装成通过。
-    expect(match, "首页未引用任何 /assets/* 构建产物").not.toBeNull();
+    const assetPath = await firstAssetPath();
+    const response = await SELF.fetch(request(assetPath));
 
-    const response = await SELF.fetch(request(match![0]));
     expect(response.status).toBe(200);
-    expectCacheControl(response, ASSET_CACHE_MAX_AGE, `构建产物 ${match![0]}`);
+    expectCacheControl(response, ASSET_CACHE_MAX_AGE, `构建产物 ${assetPath}`);
     expectSecurityHeaders(response, "构建产物 200", ASSET_CACHE_MAX_AGE);
   });
 
+  // 304 必须同样带一年 immutable。
+  //
+  // 这条钉的是 Go 的时序：web.go:143 先 Set(Cache-Control)，:162-164 才写 304，
+  // 所以 304 继承长缓存。若判定写成「仅 status === 200」，304 会落到 no-store，
+  // 客户端在条件请求命中后反而丢掉长缓存——而一年 immutable 的全部收益恰在
+  // 条件请求这一格。
+  //
+  // 用 If-None-Match 带上游 ETag 触发条件请求：ETag 由资产层按内容算出，
+  // 因此第一次取到它、第二次带着它请求即可。
+  it("304 条件命中后仍带一年 immutable", async () => {
+    const assetPath = await firstAssetPath();
+    const first = await SELF.fetch(request(assetPath));
+    expect(first.status).toBe(200);
+
+    const etag = first.headers.get("ETag");
+    // 资产层不给 ETag 时条件请求无法触发。明确失败而不是跳过：这条用例的
+    // 全部价值就在于验证 304 分支，跳过等于让它永远不生效。
+    expect(etag, `构建产物 ${assetPath} 未带 ETag，无法触发 304`).not.toBeNull();
+
+    const conditional = await SELF.fetch(
+      request(assetPath, { headers: { "If-None-Match": etag! } }),
+    );
+    expect(conditional.status).toBe(304);
+    // 304 无 body，不能读 json/text；只断言头部。
+    expectCacheControl(conditional, ASSET_CACHE_MAX_AGE, `304 ${assetPath}`);
+    expectSecurityHeaders(conditional, "构建产物 304", ASSET_CACHE_MAX_AGE);
+  });
+
+  // 字体文件的缓存策略与 /assets/ 同族：Go 的 web.go 对这两个前缀一视同仁
+  // （`strings.HasPrefix(path, "/assets/") || strings.HasPrefix(path, "/fonts/")`），
+  // web_test.go 另有 TestFrontendFontsImmutableCache 单独锁字体。
+  //
+  // 这条的存在理由：只锁 /assets/ 时，把 ASSET_PATH_PREFIXES 缩成 ["/assets/"]
+  // 不会有任何测试翻红——实现写了但没人守。字体走的是同一条 isAssetPath 分支，
+  // 少一个前缀就等于字体静默失去年缓存。
+  it("/fonts/* 命中后同样带一年 immutable", async () => {
+    const fontPath = await firstFontPath();
+    const response = await SELF.fetch(request(fontPath));
+
+    expect(response.status).toBe(200);
+    expectCacheControl(response, ASSET_CACHE_MAX_AGE, `字体 ${fontPath}`);
+    expectSecurityHeaders(response, "字体 200", ASSET_CACHE_MAX_AGE);
+  });
+
   // 缺失的构建产物不得继承一年长缓存：Go 的 web.go 只在确认资源存在后设
-  // immutable（static_cache_test.go 有两条锁这个）。这里用 status 判定复刻。
+  // immutable（static_cache_test.go 有两条锁这个）。
   it("缺失的 /assets/* 不带 immutable", async () => {
     const response = await SELF.fetch(request("/assets/does-not-exist-hash.js"));
 

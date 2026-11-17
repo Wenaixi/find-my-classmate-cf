@@ -14,7 +14,22 @@
     "resolveJsonModule": true,
     "isolatedModules": true,
     "noEmit": true,
-    "jsx": "react-jsx"
+    "jsx": "react-jsx",
+    // types: [] 是刻意显式写空数组，不是省略后碰巧继承。
+    //
+    // TypeScript 在未指定 types 时会自动纳入 node_modules/@types 下的全部包。
+    // 本仓库装了 @types/node（为了 wrangler-config.test.ts 读 node:fs），于是
+    // process / Buffer / require 等 Node 全局会在整个前端项目里静默可用——前端
+    // 代码里写 process.cwd() 不会报错，跑起来才在浏览器里崩。
+    //
+    // 实证：省略 types 时，一个不含任何 /// <reference> 的探针文件用
+    // process.cwd() / Buffer.from() / require("node:fs") 三者全部编译通过；
+    // 写成 [] 后三者立刻报 TS2591。
+    //
+    // 需要 Node 类型的单个文件自行用文件级 /// <reference types="node" /> 取用
+    // （见 src/worker/wrangler-config.test.ts），这样 Node 类型的作用域被压到
+    // 真正需要它的那个文件。
+    "types": []
   },
   // src/worker/index.ts 与 index.test.ts 归 tsconfig.worker.json，不在此项目内。
   // 理由不是分工好看，而是两套全局类型无法共存：本项目用 DOM lib，它把 Request
@@ -23,8 +38,20 @@
   // 同一编译项目里两份声明会合并成互相不兼容的重载，装配层传一个 DOM Request
   // 给 env.ASSETS.fetch 就会编译失败。拆项目后每个文件只见到自己那套全局。
   //
-  // 排除必须显式列出这两条：include 是 "src" 覆盖全树，光靠 worker 项目 include
+  // wrangler-config.test.ts 也不在此项目内：它需要 node:fs，而 TypeScript 的
+  // 全局声明没有文件作用域——该文件一旦在本项目里，@types/node 的 process /
+  // Buffer 等全局就对整个前端编译单元可见。实测：把本文件移走后，一个不含
+  // 任何 /// <reference> 的探针用 process.cwd() 立刻报 TS2591；放回后又通过。
+  // 因此它由 tsconfig.node.json 编译，Node 类型在那一个项目里用，前端项目配合
+  // 下面的 types: [] 完全见不到 Node 全局。
+  //
+  // 排除必须显式列出：include 是 "src" 覆盖全树，光靠别的项目 include
   // 不会把文件从本项目里移走，结果是同一文件被两个项目各编译一次。
   "include": ["src"],
-  "exclude": ["src/worker/index.ts", "src/worker/index.test.ts", "src/worker/env.d.ts"]
+  "exclude": [
+    "src/worker/index.ts",
+    "src/worker/index.test.ts",
+    "src/worker/env.d.ts",
+    "src/worker/wrangler-config.test.ts"
+  ]
 }

@@ -1,11 +1,22 @@
 {
+  // 不设 composite：本项目要消费 src/worker/wrangler-config.test.ts 及其导入链
+  // （vitest 类型），composite 要求把每个参与文件逐一列进 include，维护那份
+  // 清单的成本高于收益（worker 项目当初也是同样的理由去掉 composite）。
+  "include": ["vite.config.ts", "vitest.config.ts", "src/worker/wrangler-config.test.ts"],
   "compilerOptions": {
-    "composite": true,
     "skipLibCheck": true,
     "module": "ESNext",
     "moduleResolution": "Bundler",
     "allowSyntheticDefaultImports": true,
-    "noEmit": true
-  },
-  "include": ["vite.config.ts", "vitest.config.ts"]
+    "noEmit": true,
+    // 显式纳入 Node 类型：本项目装的是纯 Node 代码（vite/vitest 配置）以及
+    // 一个需要 node:fs 的配置契约测试。
+    //
+    // 显式列 "node" 而不是省略 types：省略会让 @types 下的全部包自动进来，
+    // 于是多装一个 @types 包就可能悄悄改变这里的类型环境。列出来只拿 node。
+    "types": ["node"],
+    // strict 与 app 项目对齐：契约测试用 JSON.parse 之后的 unknown 值做结构化
+    // 断言，宽松模式会把 undefined 与 null 的区别抹平。
+    "strict": true
+  }
 }

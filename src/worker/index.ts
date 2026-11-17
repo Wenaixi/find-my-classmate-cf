@@ -123,11 +123,15 @@ function isAssetPath(pathname: string): boolean {
 //
 // 缺失资源不继承 immutable：Go 的 web.go 只在确认资源存在后设长缓存，
 // 缺失的 /assets/* 走 404 且不带 immutable（static_cache_test.go 有两条锁这个）。
-// 这里用 status 判定复刻同一事实：非 200 的响应不设长缓存，改铺 no-store。
+//
+// 判定是 200 或 304，不是「仅 200」。304 来自 If-None-Match 命中，它本身就是
+// 「资源存在且未变」的证据；Go 的时序是先 Set(Cache-Control)（web.go:143）
+// 再写 304（:162-164），因此 **304 继承一年 immutable**。若这里只认 200，
+// 304 会落到 no-store，客户端在条件请求之后反而丢掉长缓存——下次还得回源校验，
+// 而一年 immutable 的全部收益就在条件请求这一格。
 //
 // 无 body 的状态码（204/304）必须显式传 null body：给 Response 构造器传一个
-// 非 null body 会抛「Invalid response status code」，而 304 正是静态资源条件
-// 请求会走到的状态（ETag + If-None-Match）。
+// 非 null body 会抛「Invalid response status code」。
 //
 // 不提 101：实测 `new Response(null, { status: 101 })` 直接抛错（status 必须在
 // 200-599 之间）。它不可能出现在这条链的响应里，留着那半个判定只会让读者以为
@@ -135,9 +139,10 @@ function isAssetPath(pathname: string): boolean {
 function withSecurityHeaders(request: Request, response: Response): Response {
   const headers = new Headers(response.headers);
   setSecurityHeaders(headers);
-  // setSecurityHeaders 已按全站契约铺了 no-store；静态产物命中成功响应时
-  // 用同一个 set 覆盖成 immutable——与 Go 的「后写者胜」等价，只是显式选值。
-  if (isAssetPath(new URL(request.url).pathname) && response.status === 200) {
+  // setSecurityHeaders 已按全站契约铺了 no-store；静态产物的「存在」响应（200
+  // 与 304）用同一个 set 覆盖成 immutable——与 Go 的「后写者胜」等价，只是显式选值。
+  const exists = response.status === 200 || response.status === 304;
+  if (isAssetPath(new URL(request.url).pathname) && exists) {
     headers.set("Cache-Control", ASSET_CACHE_MAX_AGE);
   }
   const body = response.status === 204 || response.status === 304 ? null : response.body;

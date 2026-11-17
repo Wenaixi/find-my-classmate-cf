@@ -1,12 +1,17 @@
-/// <reference types="node" />
-// 部署配置的契约测试：跑在 node 项目里读 wrangler.jsonc，断言「路由层」的
-// 关键字段。
+// 部署配置的契约测试：读 wrangler.jsonc，断言「路由层」的关键字段。
 //
-// 文件级的 node 类型引用必须在最顶部（在任何 import 之前）：本项目
-// （tsconfig.app.json）不列 types，@types/node 的全局声明因此不会自动进来，
-// 而 node:fs 需要它。写成文件级而不是往 app 项目的 types 里加 node，是因为
-// 只有这一个测试需要读磁盘——把 node 全局塞进整个前端项目会让「Node 才有的
-// API 在前端代码里不报错」成为既成事实。
+// 这个文件由 tsconfig.node.json 编译，不由 tsconfig.app.json 编译。
+//
+// 为什么不留在 app 项目里只加一条文件级 /// <reference types="node" />：
+// TypeScript 的全局声明没有文件作用域。某个文件一旦引入 @types/node，它的
+// process / Buffer / __dirname 等全局就对**整个编译单元**可见——实测把本文件
+// 移走后，一个不含任何 reference 的探针文件立刻报 TS2591；放回本文件，同一个
+// 探针又编译通过。所以「文件级 reference 能把 Node 类型压到单文件」这条路
+// 不成立，只能靠编译项目边界来隔离。
+//
+// 归属：tsconfig.node.json（本来就装 vite.config.ts / vitest.config.ts 这类
+// 纯 Node 代码的项目）显式声明 types: ["node"]；tsconfig.app.json 声明
+// types: []，前端项目因此完全见不到 Node 全局。
 //
 // 为什么必须有这一组：wrangler.jsonc 里 assets.run_worker_first 决定平台是否
 // 先把请求交给 Worker 脚本。它默认为关闭，此时命中的静态文件直接由 Asset
@@ -15,8 +20,9 @@
 // 默认导出的 fetch，天然绕过 assets 路由层，所以装配链全绿也证明不了线上成立。
 // 只能靠读配置来钉。
 //
-// 放在 frontend 项目而不是 worker 项目，是因为 workerd 里没有 node:fs
-// （实测 readFileSync 在 worker 项目里报 no such file or directory）。
+// 不放 worker 项目的原因：workerd 的打包根不是仓库根，readFileSync 相对路径
+// 会落到 /bundle/wrangler.jsonc 并报 ENOENT（注意这是**路径不存在**，
+// node:fs 模块本身是解析成功的——workerd 通过 nodejs_compat 提供该模块）。
 // 配置是部署事实、不属于运行时行为，归 node 项目语义上也更对。
 //
 // 解析用 JSONC 的最小处理：剥注释、去尾逗号。不引第三方解析器，也不 import
