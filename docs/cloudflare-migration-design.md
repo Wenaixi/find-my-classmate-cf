@@ -1,10 +1,12 @@
 # FindMyClassmate 迁移到 Cloudflare 全程托管：设计规格
 
-日期：2026-11-15
-状态：已与主人对齐决策（会话内批准本规格即批准进入实施计划阶段）
-对应代码基线：v0.12.0（多学校模式，Go 单二进制 + Docker 自托管）
+日期：2026-11-15（2026-11-18 收口）
+状态：**已完成。** 迁移按本规格落地，实施结果与验收记录见文末「实施结果」。正文保持设计时的原貌，不按结果回改——它是决策的现场记录，改写成「事后应该怎么写」会抹掉当时为什么这么选。
+对应代码基线：v0.12.0（多学校模式，Go 单二进制 + Docker 自托管）→ 当前形态（单 Cloudflare Worker + Workers KV）
 
 ## 1. 背景与目标
+
+> 本节及以下至 §7 的内容是 **2026-11-15 设计时**的现场记录，「现状」一律指迁移前。现状请看 `docs/ARCHITECTURE.md`。
 
 FindMyClassmate 当前是「Go 标准库查询服务 + React 前端」的单二进制应用：
 前端产物经 `//go:embed` 嵌入 Go 二进制，单进程同时托管页面与 `/api`，Docker 部署、
@@ -46,9 +48,9 @@ FindMyClassmate 当前是「Go 标准库查询服务 + React 前端」的单二�
 仓库根（现有项目原地演进）
 ├── wrangler.jsonc            # Worker + Assets + KV 绑定 + 环境配置
 ├── src/shared/               # 新增：纯逻辑单一 owner 层
-│   ├── query.ts              # 查询解析（原 src/lib/query.ts 迁入；现被前端与 Worker 共用）
-│   ├── classparse.ts         # 班级解析（现 Go server/classparse.go 逻辑平移；前端镜像收编于此）
-│   ├── grades.ts             # knownGrades / gradeValues / gradeAliases 单一声明（现 Go config.go + 前端 types.ts 双写，收编）
+│   ├── query.ts              # 查询解析（自 src/lib/query.ts 迁入；现被前端与 Worker 共用）
+│   ├── classparse.ts         # 班级解析（设计时 Go classparse.go 的逻辑平移；前端镜像收编于此）
+│   ├── grades.ts             # 年段值域单一声明（设计时 Go config.go 与前端 types.ts 双写，此处收编）
 │   └── contract.ts           # 跨语言契约常量（MAX_LIMIT 等；现 Go config.go + 前端 config.ts 双写，收编）
 ├── src/worker/               # 新增：Worker 专属
 │   ├── index.ts              # fetch handler + 路由装配 + 中间件链
@@ -61,9 +63,9 @@ FindMyClassmate 当前是「Go 标准库查询服务 + React 前端」的单二�
 ├── src/lib/                  # 现有前端（api.ts / searchReducer / components 等保留不动）
 ├── dist/                     # vite build 产物 → Workers Assets 目录
 ├── public/                   # 现有静态资源（字体等）
-└── scripts/
-    ├── upload-roster.mjs     # 管理脚本：读 data/*.json → PUT 管理 API
-    └── local-dev.mjs         # 本地冒烟：wrangler dev 与旧 Go 的响应对拍（迁移期）
+├── scripts/
+│   ├── upload-roster.mjs     # 管理脚本：读 data/*.json → PUT 管理 API
+│   └── gen-secrets-file.mjs  # 部署时生成 --secrets-file 用的 JSON（原计划的 local-dev.mjs 已删，见文末）
 ```
 
 ### 3.2 存储层（KV）
@@ -195,7 +197,7 @@ FindMyClassmate 当前是「Go 标准库查询服务 + React 前端」的单二�
 4. **阶段 3：Worker 装配**。`index.ts`/`middleware.ts`/`handlers.ts`/`errors.ts`；
    `wrangler.jsonc` + vite 配置对齐（build 产物 → dist）；本地 `wrangler dev` +
    miniflare 集成测试；`local-dev.mjs` 并行对拍旧 Go 服务与 Worker 的响应
-   逐字段一致。
+   逐字段一致。（该脚本随 Go 删除，见文末「实施结果」第 3 条。）
 5. **阶段 4：管理 API 与脚本**。admin 端点 + token 认证 + `upload-roster.mjs`；
    数据迁移执行；真实 HTTP 冒烟（/api/health、纯分隔符 total=0、「一一班」、
    高一全量、静态资源缓存头）。
@@ -237,3 +239,16 @@ FindMyClassmate 当前是「Go 标准库查询服务 + React 前端」的单二�
 | 管理 API 成为攻击面 | Bearer token + 常量时间比较 + 仅管理端点；无管理网页 |
 | Rate Limiting 绑定的免费层配额与近似语义 | 实施期先 `wrangler deploy --dry-run` 验配置、本地 miniflare 验行为；若免费层不允许该绑定，退回 WAF 单规则（返回体不可定制）或接受更粗粒度 |
 | 契约语料在单侧化后失去「对拍」校验 | shared 层编译期检查继承；语料测试照常全绿是迁移期双绿的硬门槛 |
+
+## 8. 实施结果（2026-11-18）
+
+八阶段全部落地。以下是与设计稿有出入或需要特别记住的几条：
+
+1. **验收基线**：`npm run typecheck` CLEAN、`npm test` 24 文件 / 614 条全过、`npm run build` exit 0、`npx wrangler deploy --dry-run` exit 0。契约语料 59 条在 `src/shared/query.test.ts` 与 `src/worker/search.test.ts` 两侧逐条断言通过。
+2. **行为等价性**：三份真实名单（7088 名学生）、26 条查询在旧 Go 服务与 Worker 上逐字段一致，另造一次单字段变异验证比较器能抓差异。完整记录只在 `.superpowers/sdd/2026-11-15-cloudflare-migration/task-15-report.md`，**故意不入库**（报告含真实姓名与查询命中数，属隐私红线）。这意味着该基线没有任何可执行断言守着——要重验得按那份报告复制名单与查询集。
+3. **`scripts/local-dev.mjs` 已删**（619 行，Go↔Worker 并行对拍脚手架）。它的 `main()` 需要两侧都在运行，Go 删除后主流程永久不可执行，只剩一个测自己比较函数的 `--self-test`。本规格 §3.1 的目录树与 §4 阶段 3 提到它的两处已就地标注，不进 CI。
+4. **CI 的实际顺序与规格 §3.8 有一处不同**：`build` 必须早于 `test`。worker 集成测试从 `dist` 的真实产物里取哈希路径（`firstAssetPath()` / `firstFontPath()`），而 `dist` 被 gitignore、`npm ci` 不产出它。顺序反过来会红 5 条，失败信息看起来像「静态资源分支坏了」。
+5. **`run_worker_first` 取 `true` 而不是 §3.5 写的 `["/api/*"]`**。白名单形态会让静态请求绕过 Worker，六条安全头、公共限流与访问日志同时失效，而迁移前的全站契约是对所有响应生效。代价是静态请求也消耗 Worker 调用额度。
+6. **健康检查多了一个降级原因**。规格 §3.4 只写了 `reason:"data"`。实测后加 `reason:"partial"`：`roster:index` 声明的某校在 KV 里读到 `null`（写扩散窗口的必然产物）时，其余学校照常服务但对外数据少一所，答 200 ok 就等于声称一份不完整的名单完整可用。`partial` 与 `data` 的处置动作不同（前者等缓存扩散，后者查上传）。
+7. **`nodejs_compat` 未启用**：实现全程只用了 Workers 原生 API 与 WebCrypto，没有需要 Node 兼容层的依赖。
+8. **免费层限流绑定配额**（§3.6 末尾列为实施验证点）：`wrangler deploy --dry-run` 验过配置合法；真实部署的配额行为未在本仓留下记录，升级到多 namespace 前需复核。
