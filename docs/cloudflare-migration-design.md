@@ -48,7 +48,7 @@ FindMyClassmate 当前是「Go 标准库查询服务 + React 前端」的单二�
 仓库根（现有项目原地演进）
 ├── wrangler.jsonc            # Worker + Assets + KV 绑定 + 环境配置
 ├── src/shared/               # 新增：纯逻辑单一 owner 层
-│   ├── query.ts              # 查询解析（自 src/lib/query.ts 迁入；现被前端与 Worker 共用）
+│   ├── query.ts              # 查询解析（自迁移前的前端 query 模块迁入；现被前端与 Worker 共用）
 │   ├── classparse.ts         # 班级解析（设计时 Go classparse.go 的逻辑平移；前端镜像收编于此）
 │   ├── grades.ts             # 年段值域单一声明（设计时 Go config.go 与前端 types.ts 双写，此处收编）
 │   └── contract.ts           # 跨语言契约常量（MAX_LIMIT 等；现 Go config.go + 前端 config.ts 双写，收编）
@@ -90,7 +90,7 @@ FindMyClassmate 当前是「Go 标准库查询服务 + React 前端」的单二�
   双写同一套语义，靠跨语言对拍（Go 读 TS 源码抽字面量）兜底；对拍对「两端一致地
   错」结构性失明（本仓第十一、十八、十九轮均有实例）。
 - 迁移后：全部收进 `src/shared/`，前端与 Worker 共用同一实现 → **跨语言对拍消灭，
-  单一 owner 取代**（`src/lib/query.ts` 迁入 `src/shared/query.ts`，前端 import
+  单一 owner 取代**（迁移前的前端 query 模块整体迁入 `src/shared/query.ts`，前端 import
   路径随之更新）。
 - 契约语料从「前后端对拍基准」升格为「唯一权威」，继续逐条断言。
 - `contract_*_test.go`（Go 读 TS 源码）随 Go 删除；其职责由 shared 层的编译期检查
@@ -187,7 +187,7 @@ FindMyClassmate 当前是「Go 标准库查询服务 + React 前端」的单二�
 
 1. **阶段 0：基线**。跑现有全量测试（Go + 前端 194 条 + typecheck + gofmt），
    记录全绿基线；确认工作区无未提交改动与迁移冲突。
-2. **阶段 1：shared 层**。`src/lib/query.ts` 迁入 `src/shared/query.ts`（import
+2. **阶段 1：shared 层**。迁移前的前端 query 模块迁入 `src/shared/query.ts`（import
    路径更新）；Go `classparse.go/config.go` 的解析语义平移为 `src/shared/classparse.ts`
    + `grades.ts` + `contract.ts`；语料测试双绿（shared 解析 ↔ 语料；Go 侧仍绿，
    作为对拍过渡）。
