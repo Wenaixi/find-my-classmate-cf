@@ -183,15 +183,20 @@ function unauthorized(): Response {
 // 定位到上传文件里的哪一层）。本文件不加前缀、不改写——文案的 owner 是校验层，
 // 这里只是搬运。
 //
-// 校名不合法（空名/保留名 index/含控制字符）同样落到这个码上：对客户端而言
-// 「这次请求给的校名不能用」与「上传的名单不能用」都是要改请求重发，码相同
+// 校名不合法（空名/保留名 index/含控制字符/键名超长）同样落到这个码上：对客户端
+// 而言「这次请求给的校名不能用」与「上传的名单不能用」都是要改请求重发，码相同
 // 不损失信息，文案已经把具体原因说清楚了。
 //
-// ponytail: 这里把 putRoster 抛出的所有错误都算校验失败，包括 KV 写失败。
-// 两者的区分需要存储层自带错误分类，而当前管理端是单管理员低频写入，
-// 一次写失败的表现是「上传没生效」，管理员重传即可；为它新增一条错误码
-// 会让 wire 契约多一个几乎不会出现的分支。需要区分时由 rosterStore 抛带
-// 分类的错误，本函数再按分类分流。
+// 本函数只处理「客户端可修」的错误。调用点的约定是：
+//
+//   InvalidSchoolNameError  校名不合法（空名/保留名/控制字符/键名超长）→ 400
+//   InvalidRosterError      名单内容不合法（解析/结构/班级格式等）→ 400 + 加载侧文案
+//   其余                     存储层抛错（KV 读写故障）→ 500 data_unavailable
+//
+// 第三类绝不能走这里：平台抛出的错误文本（上游超时、限流、值超限）会被原样
+// 塞进 message，把「存储层写失败」标注成「你上传的内容不合法」，管理员拿着
+// 好文件反复重传，同时内部错误文本外露给客户端。分流由调用点做（见 PUT 与
+// DELETE 各自的 catch），本函数不猜错误类型。
 function rosterValidationFailed(error: unknown): Response {
   return writeJSON(400, { error: ERR_INVALID_ROSTER, message: errorMessage(error) });
 }
@@ -266,10 +271,13 @@ export async function adminHandlers(request: Request, ctx: AdminContext): Promis
       //    抛出的 message 是 shared/roster.ts 的应届文案（带来源名/校名/年级名），
       //    运维据此定位到上传文件里的哪一层。
       //
-      // 其余一律是存储故障。它绝不能走 400：平台的错误文本（键值超限、限流、
+      // 其余一律是存储故障。它绝不能走 400：平台的错误文本（值大小超限、限流、
       // 超时）会被原样塞进 message，把「存储层写失败」标注成「你上传的内容
       // 不合法」——管理员拿着好文件反复重传，排障方向被引偏，同时内部错误
       // 文本外露给客户端。这里与 GET 列表同答 data_unavailable。
+      //
+      // 键名超长不在这条分支上：它已在 rosterStore.normalizeSchoolName 前置拦下，
+      // 抛 InvalidSchoolNameError，走上面的 400。
       if (error instanceof InvalidSchoolNameError || error instanceof InvalidRosterError) {
         return rosterValidationFailed(error);
       }
@@ -280,13 +288,15 @@ export async function adminHandlers(request: Request, ctx: AdminContext): Promis
   if (request.method === "DELETE") {
     // 与 GET 列表同形：store 抛错一律翻译成 data_unavailable。
     //
-    // 触发面比想象中宽——不只 index 内容损坏：超长校名在真实 KV 上会因键长
-    // 超限而抛错，而 DELETE 若让它冒泡，同一份「存储层拒绝了这个动作」在
-    // GET 得 data_unavailable（说「去修数据」）、在这里得 500 空体（说
-    //「这是代码 bug」），排障方向被引偏一层。两处同码才让人往同一处找。
+    // 触发面是「存储层自身故障」：index 内容损坏（parseSchoolIndex 抛）、
+    // KV 读写调用本身抛错（上游超时、限流之后仍失败）。这些都不该让异常冒泡，
+    // 否则同一份「存储层拒绝了这个动作」在 GET 得 data_unavailable（说「去修
+    // 数据」）、在这里得 500 空体（说「这是代码 bug」），排障方向被引偏一层。
+    // 两处同码才让人往同一处找。
     //
-    // 校名不合法（保留名 index、含控制字符）不是数据问题：InvalidSchoolNameError
-    // 由存储层抛在读写之前，它答 400（改请求重发），不走 500。
+    // 校名不合法（保留名 index、含控制字符、键名超长）不是数据问题：
+    // InvalidSchoolNameError 由存储层抛在读写之前，它答 400（改请求重发），
+    // 不走 500。键名超长在存储层前置拦下，因此不会再走到这里的 KV 抛错分支。
     try {
       const deleted = await ctx.store.deleteRoster(school);
       // deleteRoster 返回「该校是否在 index 里」：false 表示这所学校从未上传

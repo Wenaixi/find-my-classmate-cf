@@ -79,6 +79,17 @@ class IndexReadFailingKV extends FakeRosterKV {
   }
 }
 
+// PutFailingKV 让 put 直接抛错，模拟 KV 自身的写故障（上游超时、限流、值超限）。
+//
+// 用途：证明 PUT 路径上「存储层抛错 → 500 data_unavailable」这条分支常驻可测。
+// 它与「校名不合法」和「名单内容不合法」必须区分开——后两者答 400 并带文案，
+// 前者答 500 且不得把平台的原始错误文本转发给客户端。
+class PutFailingKV extends FakeRosterKV {
+  override async put(_key: string, _value: string): Promise<void> {
+    throw new Error("KV put failed: upstream timeout");
+  }
+}
+
 // rosterJson 构造上游 build_hierarchy_json.py 形状的名单原文。
 function rosterJson(school: string, grade: string, classes: Record<string, string[]>): string {
   return JSON.stringify({
@@ -355,6 +366,51 @@ describe("adminHandlers PUT", () => {
     const body = await res.json();
     expect(body.error).toBe("invalid_roster");
     expect(body.message).toContain("解析 福清一中 失败");
+  });
+
+  // 存储层写故障是服务端问题，不是「你上传的内容不合法」。这条分支此前只有
+  // 一次性探针实测过、没有常驻用例——「误标成 400」这条回归因此没有兜底。
+  //
+  // 断言三件事：状态 500、体是单键 data_unavailable（结构上就不带 message
+  // 字段，平台文本无处可放）、响应正文里不出现 KV 的原始错误文本。
+  it("KV 写故障返回 500 data_unavailable，不外露平台错误文本", async () => {
+    const kv = new PutFailingKV();
+    const payload = rosterJson("福清一中", "高一", { "1班": ["张伟"] });
+
+    const res = await adminHandlers(
+      adminRequest(`/api/admin/roster/${encodeURIComponent("福清一中")}`, { method: "PUT", token: TOKEN, body: payload }),
+      adminCtx(kv),
+    );
+
+    expect(res.status).toBe(500);
+    expect(res.headers.get("Content-Type")).toBe(jsonContentType);
+    expect(await res.json()).toEqual({ error: "data_unavailable" });
+
+    // 语义错标的直接判据：平台抛出的错误文本不得出现在响应正文里。
+    // 重新发一次请求取文本（Response body 已被上面的 json() 消费）。
+    const again = await adminHandlers(
+      adminRequest(`/api/admin/roster/${encodeURIComponent("福清一中")}`, { method: "PUT", token: TOKEN, body: payload }),
+      adminCtx(new PutFailingKV()),
+    );
+    const text = await again.text();
+    expect(text).not.toContain("KV");
+    expect(text).not.toContain("upstream timeout");
+    expect(text).not.toContain("invalid_roster");
+  });
+
+  // 对照：同一条 PUT 分支上，校名不合法与内容不合法仍必须是 400 + 文案。
+  // 这条与上一条成对出现，钉住分流的两侧——只测 500 一侧无法证明分流存在。
+  it("同一 PUT 分支上校名不合法仍答 400 并带原因", async () => {
+    const kv = new PutFailingKV();
+    const res = await adminHandlers(
+      adminRequest("/api/admin/roster/index", { method: "PUT", token: TOKEN, body: rosterJson("index", "高一", { "1班": ["张伟"] }) }),
+      adminCtx(kv),
+    );
+
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toBe("invalid_roster");
+    expect(body.message).toContain("保留字 index");
   });
 
   // 空校名段不是 PUT 的合法目标，但要分两种情况：
