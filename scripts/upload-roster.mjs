@@ -27,7 +27,7 @@
 
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { readFile, readdir, stat } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 // 命中的文件名后缀。与上游导出脚本的产物命名一致（校名_人数_roster.json）。
@@ -191,27 +191,46 @@ function stripBom(text) {
 // 符号链接要单独判：`entry.isFile()` 对 symlink 恒为 false（readdir 报的是
 // 链接自身而不是目标），于是「运维用 symlink 把名单挂进 data/」会被报成
 // 「没有 roster 文件」并 exit 2。跟着链接 stat 一次，按目标的真实类型判定。
-// 链接指向断链或目录时跳过——那两种情况读文件必然失败，让它在读取阶段报
-// 具体原因，比在这里静默过滤更好。
+//
+// 断链与目录目标的 symlink 不能静默过滤，返回 { skipped } 让调用点报出来：
+//
+//   - 只剩一个坏链接时，静默过滤仍会得到「目录里没有 roster 文件」+ exit 2，
+//     这条还算可见；
+//   - 但它混在正常文件里时，静默过滤就是「少传一整校」而 exit 0 ——
+//     与「全部成功」 indistinguishable，正好是本仓最忌的静默错数据。
+//
+// 所以这里只负责「发现」，处置（打印 + 计入 failures）归调用点。
+// 返回的文件名与跳过项都带原因，调用点不需要再 stat 一次。
 async function listRosterFiles(dir) {
   const entries = await readdir(dir, { withFileTypes: true });
   const candidates = entries.filter((entry) => entry.name.endsWith(ROSTER_FILE_SUFFIX));
 
   const files = [];
+  const skipped = [];
   for (const entry of candidates) {
     if (entry.isFile()) {
       files.push(entry.name);
       continue;
     }
-    if (entry.isSymbolicLink()) {
-      try {
-        if ((await stat(path.join(dir, entry.name))).isFile()) files.push(entry.name);
-      } catch {
-        // 断链：跳过。它读不了，列出来只会给运维一个更远的位置去查。
+    if (!entry.isSymbolicLink()) {
+      // 既不是普通文件也不是链接（目录、设备等）：同样不能静默吞掉，
+      // 否则「把名单目录挂成子目录」会表现为「少传一所」。
+      skipped.push({ name: entry.name, reason: "不是普通文件（目录或其他类型）" });
+      continue;
+    }
+    try {
+      const target = await stat(path.join(dir, entry.name));
+      if (target.isFile()) {
+        files.push(entry.name);
+        continue;
       }
+      skipped.push({ name: entry.name, reason: `符号链接指向的不是普通文件` });
+    } catch (error) {
+      const detail = error instanceof Error && error.code ? `${error.code}` : "读不到目标";
+      skipped.push({ name: entry.name, reason: `符号链接已断（${detail}）` });
     }
   }
-  return files.sort((a, b) => a.localeCompare(b, "zh-Hans-CN"));
+  return { files: files.sort((a, b) => a.localeCompare(b, "zh-Hans-CN")), skipped };
 }
 
 // uploadOne 发一次 PUT 并归类。
@@ -336,18 +355,36 @@ function printConflict(schoolName, currentFile, currentPayload, previous) {
 async function run(args) {
   const summary = { schools: 0, successes: 0, failures: 0, files: 0, aborted: false, remaining: 0 };
 
-  // 校名 → 已上传的 { file, fingerprint, payload }。整轮共享，用来识别跨文件重名。
+  // 校名 → 已上传的 { file, fingerprint }。整轮共享，用来识别跨文件重名。
   const seen = new Map();
 
-  let files;
+  let listed;
   try {
-    files = await listRosterFiles(args.dir);
+    listed = await listRosterFiles(args.dir);
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     console.log(`读取目录失败（${args.dir}）：${reason}`);
     return { ...summary, usageError: true };
   }
+  const { files, skipped } = listed;
+
+  // 被跳过的 symlink / 非常规文件先报出来，再决定是继续还是退出。
+  // 它们计入 failures：混在正常文件里时，静默少传一份会得到 exit 0，
+  // 与「全部成功」 indistinguishable —— 那正是这条路径最危险的地方。
+  for (const entry of skipped) {
+    summary.failures += 1;
+    console.log(`[失败] ${entry.name}：${entry.reason}，未上传`);
+  }
+
   if (files.length === 0) {
+    // 有跳过项时不能说「没有 roster 文件」：文件确实在，只是用不了，
+    // 原因已经逐条打印在上面。这时退出码仍是 1（有失败项），不是 2（用法错）——
+    // 「目录里什么都没有」是环境没准备好，「给了东西但用不了」是要去修那份文件，
+    // 两者的处置完全不同。
+    if (skipped.length > 0) {
+      console.log(`目录 ${args.dir} 里没有可用的 ${ROSTER_FILE_SUFFIX} 文件（上面逐条列了不可用的原因）`);
+      return summary;
+    }
     console.log(`目录 ${args.dir} 里没有 ${ROSTER_FILE_SUFFIX} 文件（后缀必须匹配，例如 福清一中_173_roster.json）`);
     return { ...summary, usageError: true };
   }
@@ -596,6 +633,38 @@ async function runSelfTest() {
     assert.notEqual(verdict.kind, "network");
   });
 
+  check("listRosterFiles：断链 symlink 进 skipped 而不是被静默丢弃", async () => {
+    // 用真实临时目录跑：这条语义（readdir 报链接自身、stat 才能看穿）只有
+    // 真文件系统能验证，伪造的 Dirent 测不出 isSymbolicLink 的真实行为。
+    const dir = path.join("tmp_selftest_list", "case");
+    await rm("tmp_selftest_list", { recursive: true, force: true });
+    await mkdir(dir, { recursive: true });
+
+    // 一份正常文件 + 一条断链 + 一条指向目录的链接。
+    await writeFile(path.join(dir, "正常校_1_roster.json"), "{}", "utf8");
+    try {
+      await symlink("../不存在的目标.json", path.join(dir, "断链校_1_roster.json"));
+      await mkdir(path.join(dir, "子目录"), { recursive: true });
+      await symlink("子目录", path.join(dir, "目录校_1_roster.json"));
+    } catch (error) {
+      // Windows 未开开发者模式时 symlink 需要提权。这种情况下跳过本条断言，
+      // 但要明确说出来，不静默当成通过。
+      console.log(`（symlink 不可用，跳过该断言：${error.message}）`);
+      await rm("tmp_selftest_list", { recursive: true, force: true });
+      return;
+    }
+
+    const { files, skipped } = await listRosterFiles(dir);
+    assert.deepEqual(files, ["正常校_1_roster.json"]);
+    assert.equal(skipped.length, 2, `跳过项数不对：${JSON.stringify(skipped)}`);
+    assert(skipped.some((item) => item.name === "断链校_1_roster.json" && item.reason.includes("已断")));
+    assert(skipped.some((item) => item.name === "目录校_1_roster.json" && item.reason.includes("不是普通文件")));
+    // 关键：被跳过的项必须能被调用点看见并计入失败——静默丢弃正是这条路径的病。
+    assert(skipped.every((item) => typeof item.reason === "string" && item.reason !== ""));
+
+    await rm("tmp_selftest_list", { recursive: true, force: true });
+  });
+
   // 统一收口：同步用例这里才打印结论，async 用例先 await 再判定。
   // 顺序按登记顺序，日志因此与代码顺序一致，逐条核对时不会错位。
   for (const item of pending) {
@@ -639,6 +708,10 @@ async function main() {
   // 「已尝试」而不是「已上传」：summary.schools 在发 PUT 之前自增，重名冲突项
   // 与失败项都算进去，实际写进 KV 的数量是 summary.successes。两处用词必须分开，
   // 否则一行汇总会把「试了 3 所、只成功 1 所」说成「上传了 3 所」。
+  //
+  // summary.failures 里可能含「文件级」失败（symlink 不可用、JSON 坏）：它们不对应
+  // 任何一所学校，因此失败数可以大于「已尝试学校数 - 成功数」。差的这一块就是它们，
+  // 逐条原因已经在上面打印过。
   const unattempted = summary.aborted ? `（未尝试 ${summary.remaining} 项：本文件剩余学校 + 后续未处理文件）` : "";
   console.log(
     `汇总：文件 ${summary.files} 个，已尝试学校 ${summary.schools} 所；成功 ${summary.successes}，失败 ${summary.failures}${unattempted}`,
