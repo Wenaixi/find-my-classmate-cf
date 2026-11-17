@@ -29,8 +29,9 @@ describe("cross-language parse contract", () => {
   for (const c of contractCases) {
     it(`parses ${JSON.stringify(c.raw)} exactly as the corpus declares`, () => {
       const parsed = parseQuery(c.raw);
-      // tokens 纳入对拍后，「两端空白集合逐码位对齐」这条不变量在两侧各有承重断言。
-      // 此前它是前端独有字段、Go 侧无对应物，分词行为只能在单侧验证。
+      // tokens 是语料的一部分，因此「空白集合逐码位枚举」这条不变量在这里有承重
+      // 断言：改坏 goSpaceChars 会让分词结果与语料不一致。
+      // 历史：迁移前 tokens 只是前端独有字段、Go 侧无对应物，分词行为只能在单侧验证。
       expect(parsed.tokens).toEqual(c.tokens);
       expect(parsed.nameTokens).toEqual(c.nameTokens);
       expect(parsed.grade ?? null).toBe(c.grade);
@@ -83,7 +84,7 @@ describe("hasNameCondition", () => {
   // 含年段串的姓名：修复前被读成年段条件，此处返回 false，界面因此提示
   // 「已匹配整个年段」而实际返回整个年段的全量。修复后走姓名条件。
   // 这是前端唯一消费的布尔（searchReducer 经它派生提示文案），
-  // 解析层有契约语料对拍，但该布尔本身此前零断言。
+  // 契约语料断的是解析结果、不断这个布尔，因此它需要自己的断言。
   it("true for names containing a grade string", () => {
     expect(hasNameCondition("高一鸣")).toBe(true);
     expect(hasNameCondition("高1鸣")).toBe(true);
@@ -103,10 +104,10 @@ describe("hasNameCondition", () => {
   });
 });
 
-// 降级方向的断言。此前前端没有任何用例直接断「班级不可解析时必须降级为姓名
-// 条件」——契约语料断的是两端结果一致，两端一致地丢掉 token 时同样通过。
-// Go 端 classparse_test 有这条方向的断言（classCondition("0","0班") 必须
-// 产出非空 asName），前端此前只有对拍、没有接缝断言，两侧保护强度不对称。
+// 降级方向的断言。契约语料断的是解析结果本身，不含「降级必须产出非空姓名键」
+// 这条方向性要求——语料里一条 asName 写成空串同样会通过。
+// 历史：迁移前这份断言只在 Go 侧 classparse_test 里有，前端镜像没有。
+// 现在解析只有 shared/classparse.ts 一份实现，这条断言就是全部保护。
 describe("班级不可解析时的降级方向", () => {
   // 双向：正向断「产出了姓名匹配键」，反向断「未产出班级条件」。
   // 只断正向的话，把 classNo 恒为 0 的实现同样通过。

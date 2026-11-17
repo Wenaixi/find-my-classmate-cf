@@ -16,8 +16,9 @@ import { classCondition, classNumberHead, classToken, goSpaceSplit, normalizeNam
 // 定义与理由见 classparse.ts，此处不得出现第二份实现。
 export { normalizeName } from "./classparse";
 
-// 查询串的解析结果，是两端对拍的形状：tokens 是分词中间结果（在分类之前就已
-// 确定），nameTokens 是归一化后的姓名匹配键，grade / classNumber 是可选的精确条件。
+// 查询串的解析结果，即契约语料的声明形状：tokens 是分词中间结果（在分类之前
+// 就已确定），nameTokens 是归一化后的姓名匹配键，grade / classNumber 是可选的
+// 精确条件。
 export interface ParsedQuery {
   tokens: string[];
   nameTokens: string[];

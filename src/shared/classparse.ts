@@ -14,13 +14,14 @@
 //
 // 本文件不依赖 grades.ts：班级解析与年段值域是两个独立领域，方向保持单向。
 
-// 汉字数字的单字符集是班级域的跨语言契约：本文件的全部用途——正则字符类、
+// 汉字数字的单字符集是班级域的唯一声明：本文件的全部用途——正则字符类、
 // 连写守门、值映射——都由下方 chineseDigitOnes 派生，不得手抄第二份字符集。
-// 两端此前共六份手抄（Go 端三处、TS 端三处）。第十八轮变异实验实测：把两端
-// classNumberHead 同时删掉「四」与「七」，Go 全量测试与前端 194 条契约对拍
-// 全部零翻红——语料与对拍在结构上表达不出「两端一致地错」，而守门收窄会让
-// 「高一四班」从「高一 + 4 班」退化为整年段全量返回。单一 owner 使此类分叉
-// 的载体不复存在，剩余防御是下方契约用例。
+// 两份实现时期曾共六份手抄（Go 端三处、TS 端三处）。第十八轮变异实验实测：
+// 把两端 classNumberHead 同时删掉「四」与「七」，Go 全量测试与前端 194 条契约
+// 对拍全部零翻红——语料与对拍在结构上表达不出「两端一致地错」，而守门收窄会让
+// 「高一四班」从「高一 + 4 班」退化为整年段全量返回。收成单一 owner 后分叉的
+// 载体不复存在，但**语料取样不足这一点没变**：把这里的「四」「七」删掉，现在
+// 依然不会翻红，因为语料里没有这两个字开头的连写样本。
 //
 // 「十」单独处理而非并入：它的值是 10 而不是位置即值，而 chineseDigitOnes
 // 的顺序恰好是值序（index+1），两者不能共用一条推导。
@@ -57,8 +58,8 @@ export const classNumberPattern = "[0-9]+|" + chineseNumberPattern;
 export const classToken = new RegExp(`^(${classNumberPattern})班?$`);
 
 // classHeadChars 是 classNumberHead 的字符集：阿拉伯数字加十个汉字数字。
-// 单独提出为常量，使跨语言对拍能直接锁它——锁整个正则会被 "^" 与字符类的
-// 包装形式干扰，而真正需要两端一致的是这串字符。
+// 单独提出为常量，让字符集与包装形式分开：锁整条正则会被 "^" 与字符类的
+// 包装写法干扰，而真正决定接受域的就是这串字符。
 export const classHeadChars = "[0-9" + chineseDigitOnes + "十]";
 
 // classNumberHead 只判「以班号字符开头」，不判整段可解析：年级+班级连写
@@ -66,7 +67,8 @@ export const classHeadChars = "[0-9" + chineseDigitOnes + "十]";
 // 字符却解析失败——后者必须放行到 classCondition 降级路径，整段匹配
 // （classToken）会把「一一」一并挡在降级路径之外。
 // 字符集与 chineseDigitOnes 同源派生：它曾零对拍且收窄即致整年段全量，
-// 现已无法与 chineseNumberPattern 分叉。
+// 现已无法与 chineseNumberPattern 分叉。注意语料里没有「四」「七」开头的
+// 连写样本，这两个字的守门回归目前无测试可发现。
 export const classNumberHead = new RegExp("^" + classHeadChars);
 
 // chineseNumberToInt 解析汉字数字（支持一~九十九 与 十~十九），返回前端域：
