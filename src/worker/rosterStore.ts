@@ -35,7 +35,7 @@ import {
 import type { RosterStudent } from "../shared/student";
 
 // KV 读取选项。cacheTtl 是 Workers KV 的 read cache：同一个 colo 上的重复读
-// 命中边缘缓存，不重复计费也不重复跨区回源。60 秒与计划书一致——名单是低频
+// 命中边缘缓存，不重复计费也不重复跨区回源。60 秒与迁移设计一致——名单是低频
 // 写、高频读的数据，一分钟的滞后对「刚上传完想立刻看到」的场景仍可接受。
 export interface RosterKVGetOptions {
   type?: "text";
@@ -103,7 +103,7 @@ export class InvalidRosterError extends Error {
 // READ_OPTIONS 抽出共用，避免四个读取点各写一份字面量后悄悄分叉
 // （例如某处漏了 cacheTtl，读数就不再走边缘缓存，计费与延迟都变）。
 //
-// cacheTtl 取 60 是与计划书一致的策略值，不是平台下限：官方文档写明
+// cacheTtl 取 60 是与迁移设计一致的策略值，不是平台下限：官方文档写明
 // cacheTtl 最小值是 30，默认值也是 60。取默认值的理由有两条——名单是
 // 写少读多的数据，60 秒的读缓存能显著减少同一 colo 的回源与计费；
 // 代价是「刚写入的名单在别的 colo 上最多晚 60 秒可见」，而这个代价直接
@@ -121,7 +121,7 @@ const ROSTER_KEY_MAX_BYTES = 512;
 // 由 KV 的 read cache 与写扩散决定，进程内再缓一层会让管理端上传后
 // 的可见延迟变成两段不可预期的叠加。
 export class RosterStore {
-  // 构造只收 kv。计划书里那个 now?: () => number 在本任务没有任何消费者
+  // 构造只收 kv。设计稿里那个 now?: () => number 在本任务没有任何消费者
   // （没有 TTL 判定，也没有失败冷却），为空参数写接口只会让后续读者以为
   // 这里存在时间相关行为。真需要时钟时补一个可选参数不破坏任何调用点。
   constructor(private readonly kv: RosterKV) {}

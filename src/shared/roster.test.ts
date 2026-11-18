@@ -444,7 +444,7 @@ describe("RosterLoadState 失败后不可复用", () => {
 
 describe("加载序 → SchoolIdx → 学校下拉 端到端", () => {
   it("多次调用模拟多文件：SchoolIdx 单调递增，下拉只含高中校且按文件加载序", () => {
-    // 这条用例承接 Task 7 评审的两条上游约束：
+    // 这条用例承接评审定下的两条上游约束：
     //   1) 未识别年段必须映射为 gradeIdx === gradeValues.length，否则小学边界失效；
     //   2) SchoolIdx 必须单调递增且与校名一一对应，schoolList 的排序正确性依赖它。
     // 端到端串起「加载态 → 学生快照 → 下拉」，使这两条不再只有 Go 侧守。

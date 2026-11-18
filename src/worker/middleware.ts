@@ -8,7 +8,7 @@
 // cf-connecting-ip 头（裸地址）。maskedIP 对两种形态都能处理，脱敏规则不分叉。
 //
 // 链顺序（securityHeaders / rateLimit / accessLog 谁在外）不由本文件决定，
-// 与 Go 一样收敛在装配层一处（Task 14/15 的 index）。
+// 与 Go 一样收敛在装配层一处（迁移评审要求）。
 
 // 安全响应头的值逐字对齐 server/middleware.go 的 setSecurityHeaders。
 // 值里的空格顺序也是契约的一部分：前端资源与浏览器解析都按这份字符串，

@@ -150,7 +150,7 @@ describe("wrangler.jsonc 部署契约", () => {
   // ADMIN_TOKEN 的值不得进配置文件，但名字要进 secrets.required。
   //
   // 原断言是 `raw not.toContain("ADMIN_TOKEN")`，钉的是「走 secret 供给」这条
-  // 约定。Task 17 按部署规格补了 secrets.required 之后那条会翻红——它不是约定
+  // 约定。部署规格补了 secrets.required 之后那条会翻红——它不是约定
   // 失效，而是断言写得太粗：把「名字」和「值」当成了同一个东西。进仓库的名字
   // 只是绑定声明，泄露风险在值上。
   //

@@ -11,7 +11,7 @@
 // `npm test` 必须串两个脚本，任一方漏跑都没有信号——而漏跑一个项目正是这次
 // 迁移最需要防的失误（新增的集成用例会静默不执行，套件仍然全绿）。
 //
-// include 划分是硬约束（Ruling 4）：
+// include 划分是硬约束（评审定案）：
 // - 前端项目收 src 下全部 *.test.{ts,tsx}，显式排除 src/worker/index.test.ts。
 //   不做排除的后果是同一条测试被两个项目各跑一遍，前端那份会因为解析不了
 //   cloudflare:test 而报模块缺失——错误信息看起来像插件配置坏了，实际是归属
@@ -41,7 +41,7 @@ export default defineConfig({
         // env 与真实部署同源（同一份 kv_namespaces / ratelimits / assets 声明）。
         //
         // ADMIN_TOKEN 走 miniflare 覆盖而不写进 wrangler.jsonc：它是要部署的
-        // 配置文件，明文写一个管理端凭据进去等于把真凭据交给仓库（Task 17 会
+        // 配置文件，明文写一个管理端凭据进去等于把真凭据交给仓库（部署配置补全环境变量的迁移提交会
         // 用 secret 供给）。测试在 miniflare 层注入固定值，既让管理端全链路
         // 可跑，又不动部署配置。
         plugins: [

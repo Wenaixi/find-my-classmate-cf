@@ -4,7 +4,7 @@
 // TestSearchDataUnavailable、TestSearchMethodNotAllowed、
 // TestSearchRejectsOutOfRangeParameters、TestSearchRejectsOverlongQuery、
 // TestSearchAcceptsBoundaryParameters，并补上 schools 端点与健康检查差集降级
-// （Ruling 13 要求的前端可观测降级信号）。
+// （评审要求的前端可观测降级信号）。
 //
 // 上面列出的每个 Go 用例名都必须在本文件里有一条对应断言，否则这条清单就是
 // 虚假覆盖声明——评审轮 1 正是凭这份清单发现 health 的 405 契约无人承接。

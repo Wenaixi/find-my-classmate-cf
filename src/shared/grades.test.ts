@@ -3,7 +3,7 @@
 // 这组断言锁的不是「解析用的正则长什么样」，而是「声明本身完整且自洽」：
 // 别名必须映射回已声明的规范名，否则前端会产出不在 Grade 值域内的年段。
 // 用例从 src/lib/query.test.ts 的 gradeDomain 用例平移而来（去掉 parseQuery
-// 依赖，只测声明本体；query.test.ts 中旧用例在 Task 3 随测试文件一并移动）。
+// 依赖，只测声明本体；query.test.ts 中旧用例随测试文件一并移动）。
 //
 // 「Grade 联合与年段值域互相完整」这条反向完整性由编译器强制：
 // grades.ts 内的 GradeDomainGap 检查在 Grade 联合出现 gradeValues 未声明的

@@ -48,7 +48,7 @@
 //   重新变成 API 专属。
 //
 //   注意这条自测不出来：SELF.fetch 直接代理到默认导出的 fetch，天然绕过
-//   assets 路由层。因此 index.test.ts 里另有一条读本文件、断言
+//   assets 路由层。因此 wrangler-config.test.ts 里另有一条读本文件、断言
 //   run_worker_first === true 的配置用例（见「部署配置契约」一组）。
 {
   "$schema": "node_modules/wrangler/config-schema.json",

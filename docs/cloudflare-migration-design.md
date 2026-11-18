@@ -245,7 +245,7 @@ FindMyClassmate 当前是「Go 标准库查询服务 + React 前端」的单二�
 八阶段全部落地。以下是与设计稿有出入或需要特别记住的几条：
 
 1. **验收基线**：`npm run typecheck` CLEAN、`npm test` 24 文件 / 614 条全过、`npm run build` exit 0、`npx wrangler deploy --dry-run` exit 0。契约语料 59 条在 `src/shared/query.test.ts` 与 `src/worker/search.test.ts` 两侧逐条断言通过。
-2. **行为等价性**：三份真实名单（7088 名学生）、26 条查询在旧 Go 服务与 Worker 上逐字段一致，另造一次单字段变异验证比较器能抓差异。完整记录只在 `.superpowers/sdd/2026-11-15-cloudflare-migration/task-15-report.md`，**故意不入库**（报告含真实姓名与查询命中数，属隐私红线）。这意味着该基线没有任何可执行断言守着——要重验得按那份报告复制名单与查询集。
+2. **行为等价性**：三份真实名单（7088 名学生）、26 条查询在旧 Go 服务与 Worker 上逐字段一致，另造一次单字段变异验证比较器能抓差异。完整记录只在迁移工作区的未入库目录 `.superpowers/sdd/2026-11-15-cloudflare-migration/task-15-report.md`，**故意不入库**（报告含真实姓名与查询命中数，属隐私红线）。这意味着该基线没有任何可执行断言守着——要重验得先从本地迁移工作区取回那份报告（克隆内没有），再按报告复制名单与查询集。
 3. **`scripts/local-dev.mjs` 已删**（619 行，Go↔Worker 并行对拍脚手架）。它的 `main()` 需要两侧都在运行，Go 删除后主流程永久不可执行，只剩一个测自己比较函数的 `--self-test`。本规格 §3.1 的目录树与 §4 阶段 3 提到它的两处已就地标注，不进 CI。
 4. **CI 的实际顺序与规格 §3.8 有一处不同**：`build` 必须早于 `test`。worker 集成测试从 `dist` 的真实产物里取哈希路径（`firstAssetPath()` / `firstFontPath()`），而 `dist` 被 gitignore、`npm ci` 不产出它。顺序反过来会红 5 条，失败信息看起来像「静态资源分支坏了」。
 5. **`run_worker_first` 取 `true` 而不是 §3.5 写的 `["/api/*"]`**。白名单形态会让静态请求绕过 Worker，六条安全头、公共限流与访问日志同时失效，而迁移前的全站契约是对所有响应生效。代价是静态请求也消耗 Worker 调用额度。

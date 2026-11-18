@@ -9,7 +9,7 @@
 // 两条从 Go 端承重的形态约束：
 //
 // 1. 错误响应的状态不在这里出现。writeError(code, headers?) 自己查 ERR_STATUS
-//    带出状态，发射点只挑码（Ruling 15）。若在调用点写 ERR_STATUS[code]，
+//    带出状态，发射点只挑码（评审定案）。若在调用点写 ERR_STATUS[code]，
 //    漏写兜底就会把错误答成 200 + 空体，同一张表还会被每个发射点抄一遍。
 //
 // 2. 领域形状绝不出这个文件。RosterStudent 带着 nameKey / classNo / gradeIdx /
@@ -205,7 +205,7 @@ export async function schoolsHandler(request: Request, ctx: HandlerContext): Pro
 // 过期才可见（rosterStore 的 cacheTtl 当前 60 秒），因此在某个 colo 上「index
 // 已更新、某校原文还没扩散到」是正常且必然出现的窗口。窗口内服务仍在跑、
 // 其余学校照常可查，但对外数据是少一所的——此时答 200 ok 就是在向编排层与
-// 前端声称一份不完整的名单完整可用，而这正是 Task 9 里那种「静默少一所」的
+// 前端声称一份不完整的名单完整可用，而这正是评审记录里那种「静默少一所」的
 // 不可观测形态。把它报成 degraded 之后，运维能从一个探针请求看出差异，
 // 而不必等用户反馈「搜不到某校的人」。reason 取 partial 与 data 区分开：
 // data 指「一所都不可用」（loadAll 已 fail-closed），partial 指「部分学校

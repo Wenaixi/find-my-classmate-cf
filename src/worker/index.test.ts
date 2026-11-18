@@ -2,7 +2,7 @@
 // workerd 集成测试：用 cloudflare:test 的 SELF.fetch 打真实装配链，覆盖
 // 路由分流、限流短路、错误边界与安全头契约。
 //
-// 与单元测试的分工（Ruling 4）：worker/handlers.test、admin.test、middleware.test
+// 与单元测试的分工（评审定案）：worker/handlers.test、admin.test、middleware.test
 // 等留在 node 项目，它们用 fake store / fake KV 验证每条规则本身；本文件只验证
 // 「这些规则被正确装配在一起」——装配顺序、短路行为、绑定取值。同一条规则在
 // 两处都断言是刻意的：单元测试证明规则成立，集成测试证明装配没有绕过它。

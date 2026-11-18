@@ -1,6 +1,6 @@
 // rosterStore 的存储层语义回归测试。用一个内存 fake 实现 RosterKV 接口面注入，
 // 因此全部用例在 node 环境可跑，不需要 workerd 与真实 KV 绑定——真实绑定的
-// 一致性行为（cacheTtl、批量读返回 Map）留给 Task 14 的集成断言。
+// 一致性行为（cacheTtl、批量读返回 Map）留给后补的集成断言。
 //
 // 这里锁住的语义边界都直接对应 Go 端的运维后果：
 //

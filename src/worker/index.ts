@@ -33,7 +33,7 @@ import { healthHandler, notFoundHandler, schoolsHandler, searchHandler } from ".
 import { accessLog, setSecurityHeaders } from "./middleware";
 import { RosterStore, type RosterKV } from "./rosterStore";
 
-// Env 是绑定契约的唯一声明处。取值来源是 wrangler.jsonc（Task 17 补全环境变量
+// Env 是绑定契约的唯一声明处。取值来源是 wrangler.jsonc（部署配置补全环境变量的迁移提交
 // 与真实 id）：
 //
 //   ROSTER             KV namespace（rosterStore 的 RosterKV 子集即可，真实
@@ -55,7 +55,7 @@ export interface Env {
 // simple 限流只有固定窗口，对外统一给一个窗口长度，客户端据此退避即可。
 const RETRY_AFTER_SECONDS = "60";
 
-// CHECK_RATE_LIMIT 是限流判定的唯一实现，抽成可注入纯函数是刻意的：
+// checkRateLimit 是限流判定的唯一实现，抽成可注入纯函数是刻意的：
 // 测试用假 limiter 传入真实装配链，就能断言 429 的完整形态（状态、错误体、
 // Retry-After、安全头），不必在 workerd 里操控真实 binding 的计数状态。
 //
