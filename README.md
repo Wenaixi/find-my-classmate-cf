@@ -8,7 +8,7 @@ FindMyClassmate 是一个面向校园场景的班级查询工具。React + TypeS
 
 - 支持高一、高二、高三名单查询：姓名、班级、年段自由组合（年段在名单里存在即可查，不必三份都有）
 - 输入框支持空格 / 中文逗号 / 英文逗号 / 顿号分隔多条件
-- 结果按完整、前缀、包含匹配排序，支持分页加载（全员果冻融合动效）
+- 结果按完整、前缀、包含匹配排序，支持分页加载（结果容器带液体合并视觉）
 - 胶囊搜索框带彩色光束动画，搜索时思维球反馈
 - 隐私设计：不写 localStorage，不把查询词写入 URL，API 只返回姓名 / 学校 / 年级 / 班级
 
@@ -21,7 +21,7 @@ FindMyClassmate 是一个面向校园场景的班级查询工具。React + TypeS
 | 存储 | Workers KV（`roster:{校名}` 一校一键，名单不进仓库） |
 | 动效 | border-beam 1.4.1 / thinking-orbs 0.3.2 / liquid-gooey 0.2.2 |
 | 字体 | Mona Sans / Instrument Sans / IBM Plex Mono |
-| 测试 | Vitest（前端 + workerd 集成，双项目） |
+| 测试 | Vitest（前端 + workerd 集成，双项目；25 文件 / 623 条） |
 
 ## 本地开发
 

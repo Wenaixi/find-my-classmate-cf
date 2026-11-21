@@ -300,9 +300,9 @@ E2E 契约（错误码、分页响应结构、脱敏格式）在 §5.1 与 §10 
 
 ## 11. 测试策略
 
-双项目 Vitest（`vitest.config.ts` 的 `test.projects`），当前 24 个测试文件、614 条用例：
+双项目 Vitest（`vitest.config.ts` 的 `test.projects`），当前 25 个测试文件、623 条用例：
 
-- **frontend 项目**（node，需 DOM 的文件头声明 `@vitest-environment jsdom`）：查询契约（`shared/query.test.ts`）、班级解析（`shared/classparse.test.ts`）、年段值域（`shared/grades.test.ts`）、名单加载（`shared/roster.test.ts`）、学生模型（`shared/student.test.ts`）、搜索语义与语料（`worker/search.test.ts`）、状态机、竞态编排、交互语义、页面装配、组件渲染。
+- **frontend 项目**（node，需 DOM 的文件头声明 `@vitest-environment jsdom`）：查询契约（`shared/query.test.ts`）、班级解析（`shared/classparse.test.ts`）、年段值域（`shared/grades.test.ts`）、名单加载（`shared/roster.test.ts`）、学生模型（`shared/student.test.ts`）、搜索语义与语料（`worker/search.test.ts`）、状态机、竞态编排、交互语义、页面装配、组件渲染、学校选择器键盘可达性（`components/SchoolPicker.test.tsx`）、测试锚点折叠（`od.test.ts`）。
 - **worker 项目**（`@cloudflare/vitest-plugin`，workerd + miniflare KV/限流绑定）：只收 `src/worker/index.test.ts`，跑真实装配链、静态资源回退、管理端点认证与写入、`SELF.fetch` 的端点集成。入口与绑定全部从 `wrangler.jsonc` 读，因此测试 env 与真实部署同源；`ADMIN_TOKEN` 走 miniflare 覆盖而非写进配置文件。
 
 分项目的理由不是环境好玩，而是两类测试的运行时要求不兼容：Node 里没有 `cloudflare:test`，workerd 里没有 jsdom。用 `projects` 而不是两份 config + 两个脚本，因为「哪个测试归哪个项目」只有一处事实源，漏跑一个项目正是这种结构最需要防的失误（`include` 划分是硬约束，`src/worker/index.test.ts` 必须从前端项目里显式排除，否则同一条测试被跑两遍、前端那份报模块缺失）。
