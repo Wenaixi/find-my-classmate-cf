@@ -6,8 +6,15 @@
 
 ## [Unreleased]
 
+### Added
+
+- 测试锚点折叠模块 `src/od.ts`：`data-od-id` 在源码中保留、生产产物中不存在。
+
 ### Changed
 
+- 结果行去掉逐行形状物理（`morph.shape` → `observe`），保留容器级液体合并；`ResultCard` 用 `memo` 包裹，打字时不再逐行重渲染。
+- 学校选择器面板改为 `aria-labelledby="results-title"` 语义、结果列表不再声称 `role="list"`（`Liquid.Item` 的中间层使 owned-children 契约不成立）。
+- 首屏预载 `Mona Sans` 字体；`color-scheme: dark` 与滚动条配色让原生浏览器 UI 跟随深色主题。
 - **运行形态：Go 单二进制 + Docker → 单个 Cloudflare Worker。** `server/` 的 12 个模块、Dockerfile、docker-compose.yml 与 `scripts/local-dev.mjs` 全部删除，共 -7339 行；页面、`/api`、管理端点与静态资源由同一个 Worker 提供，部署命令是 `npx wrangler deploy`。
 - 名单存储：`data/` 文件热重载 → Workers KV（`roster:index` + 一校一个 `roster:{校名}`），写入走管理 API。
 - 热更新语义：文件变更 1 秒内生效 → KV 最终一致，其他边缘位置最多约 60 秒可见。
@@ -15,6 +22,12 @@
 - 查询解析与执行收进 `src/shared/`（前端与 Worker 共用一份实现），跨语言对拍机制随之退役；契约语料 `docs/query-contract.json` 从「两侧对拍基准」改为「唯一权威」，消费方是 `src/shared/query.test.ts` 与 `src/worker/search.test.ts`。
 - 测试：Go 测试套件 → Vitest 双项目（前端 node/jsdom + worker workerd），24 个文件 / 614 条用例。
 - `docs/ARCHITECTURE.md` 重写：module 表改为 shared/worker 结构，热更新、限流、CPU 边界、健康检查语义全部按新形态描述；`CONTEXT.md` 的年段值域、数据可用性、契约三组术语同步。
+
+### Fixed
+
+- 学校下拉的键盘导航此前无法选中任何学校：焦点从不进入面板，`onPanelKeyDown` 不可达（WCAG 2.1.1 A 级）。现改为面板打开即接收焦点，关闭时归还触发按钮。
+- 状态行与结果区此前都是 `aria-live="polite"`，同一次结果播报两遍；现收敛为仅状态行。
+- 测试基线：新增 `SchoolPicker.test.tsx`（5 条）与 `od.test.ts`（2 条），总数为 25 文件 / 623 条。
 
 ### Removed
 

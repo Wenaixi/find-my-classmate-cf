@@ -206,6 +206,7 @@ E2E 契约（错误码、分页响应结构、脱敏格式）在 §5.1 与 §10 
 | --- | --- | --- |
 | src/App.tsx | 页面组装；只消费查询控制器的 state/controller 两面与 `present` 展示派生，不理解 reducer/session、不手写组合判断 | 全部 |
 | src/config.ts | 契约常量的前端入口，re-export `shared/contract.ts` 并持有 `REQUEST_TIMEOUT_MS` | shared/contract |
+| src/od.ts | 测试锚点：源码保留 `data-od-id` 以让测试定位节点；生产构建由 vite 的 `__OD_ID__` 常量折叠为 `() => ({})`，展开后该属性在产物中完全不存在（不是「值为空」，是键不存在） | 无 |
 | src/types.ts | 领域类型与状态枚举；`Grade` 与 `ParsedQuery` 只 re-export 自 shared | shared/grades, shared/query |
 | src/lib/api.ts | 网络适配与响应结构校验（`decodeItem` 只认 canonical class 单字段） | types, config |
 | src/lib/searchReducer.ts | 搜索状态机纯 reducer（状态派生/错误文案/纯年段与班级整段命中提示/`present` 展示派生含错误区段文案切分） | types, api, shared/query（hasNameCondition）, resultSummary, searchSession, config |
