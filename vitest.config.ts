@@ -25,6 +25,10 @@ import { cloudflareTest } from "@cloudflare/vitest-plugin";
 import { configDefaults, defineConfig } from "vitest/config";
 
 export default defineConfig({
+  // vitest 读本文件、不读 vite.config.ts，因此测试锚点开关必须在这里再声明
+  // 一次。值为 true 意味着测试中 data-od-id 原样出现，测试可按它定位节点；
+  // 生产构建的 false 由 vite.config.ts 的 define 承担（mode === "production"）。
+  define: { __OD_ID__: JSON.stringify(true) },
   test: {
     projects: [
       {
